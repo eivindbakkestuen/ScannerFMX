@@ -352,6 +352,10 @@ begin
   RequestCancel;
   if not FStartRequested then
     Start;
+  // CancelSynchronousIo is a no-op between I/O calls, so a cancel can land just
+  // before the worker blocks on a slow share. Repeat it until the thread exits.
+  while WaitForSingleObject(Handle, 50) = WAIT_TIMEOUT do
+    RequestCancel;
   WaitFor;
   FChanges.Free;
   FCreatedNodes.Free;
