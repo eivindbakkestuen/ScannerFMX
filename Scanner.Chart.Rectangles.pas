@@ -66,9 +66,31 @@ begin
   Result := '';
 end;
 
+// A length in whole device pixels, at least one, so edges built from it stay sharp.
+function DevicePixels(Canvas: TCanvas; Value: Single): Single;
+begin
+  Result := Max(1, Round(Value * Canvas.Scale)) / Canvas.Scale;
+end;
+
+// A band of Width just inside Outer, starting Inset in from its edges.
+procedure FrameRect(Canvas: TCanvas; const Outer: TRectF; Inset, Width: Single; Color: TAlphaColor);
+var
+  R: TRectF;
+begin
+  R := Outer;
+  R.Inflate(-(Inset + Width / 2), -(Inset + Width / 2));
+  if (R.Width < 0) or (R.Height < 0) then
+    Exit;
+  Canvas.Stroke.Kind := TBrushKind.Solid;
+  Canvas.Stroke.Color := Color;
+  Canvas.Stroke.Thickness := Width;
+  Canvas.DrawRect(R, 0, 0, [], 1);
+end;
+
 procedure TRectangleChartView.PaintTile(Canvas: TCanvas; const Tile: TRectangleChartTile; Outline: Boolean);
 var
-  R, TextBounds: TRectF;
+  Cell, R, TextBounds: TRectF;
+  Line: Single;
   Color: TAlphaColorRec;
   Background: TAlphaColorRec;
   Alpha, Luminance: Single;
@@ -91,31 +113,34 @@ var
   end;
 
 begin
-  R := Tile.Bounds;
-  R.Inflate(-0.5, -0.5);
-  if R.IsEmpty then
+  // Snap every edge on its own, so neighbors that share an edge in the layout
+  // still share it on screen, and fills end on whole device pixels.
+  Cell := RectF(Canvas.AlignToPixelHorizontally(Tile.Bounds.Left), Canvas.AlignToPixelVertically(Tile.Bounds.Top),
+    Canvas.AlignToPixelHorizontally(Tile.Bounds.Right), Canvas.AlignToPixelVertically(Tile.Bounds.Bottom));
+  if (Cell.Width <= 0) or (Cell.Height <= 0) then
     Exit;
-  Canvas.Stroke.Kind := TBrushKind.Solid;
+  // One separator line about a logical pixel wide, in whole device pixels. Each
+  // tile draws it along its left and top edges and one line past its right and
+  // bottom edges, where the neighbor draws the same line.
+  Line := Max(1, Trunc(Canvas.Scale + 0.01)) / Canvas.Scale;
+  R := RectF(Cell.Left + Line, Cell.Top + Line, Cell.Right, Cell.Bottom);
   if Outline then
   begin
     // Keep the complete outline inside the tile, clear of neighboring tiles.
-    R.Inflate(-2.5, -2.5);
-    if R.IsEmpty then
+    if (R.Width < DevicePixels(Canvas, 4) * 2) or (R.Height < DevicePixels(Canvas, 4) * 2) then
       Exit;
-    Canvas.Stroke.Color := FContext.Theme.Background;
-    Canvas.Stroke.Thickness := 5;
-    Canvas.DrawRect(R, 0, 0, [], 1);
-    Canvas.Stroke.Color := FContext.Theme.Text;
-    Canvas.Stroke.Thickness := 2;
-    Canvas.DrawRect(R, 0, 0, [], 1);
+    FrameRect(Canvas, R, 0, DevicePixels(Canvas, 4), FContext.Theme.Background);
+    FrameRect(Canvas, R, DevicePixels(Canvas, 1), DevicePixels(Canvas, 2), FContext.Theme.Text);
     Exit;
   end;
+  Canvas.Fill.Kind := TBrushKind.Solid;
+  Canvas.Fill.Color := FContext.Theme.Background;
+  Canvas.FillRect(RectF(Cell.Left, Cell.Top, Cell.Right + Line, Cell.Bottom + Line), 0, 0, [], 1);
+  if R.IsEmpty then
+    Exit;
   Canvas.Fill.Color := Tile.Color;
   Canvas.FillRect(R, 0, 0, [], 1);
-  Canvas.Stroke.Color := FContext.Theme.Background;
-  Canvas.Stroke.Thickness := 1;
-  Canvas.DrawRect(R, 0, 0, [], 1);
-  if (R.Width < 28) or (R.Height < 18) then
+  if (R.Width < 28) or (R.Height < Scaled(18)) then
     Exit;
   Color := TAlphaColorRec(Tile.Color);
   Background := TAlphaColorRec(FContext.Theme.Background);
@@ -126,14 +151,13 @@ begin
     Canvas.Fill.Color := $FF152034
   else
     Canvas.Fill.Color := $FFFFFFFF;
-  Canvas.Font.Family := 'Segoe UI';
-  Canvas.Font.Size := 12;
-  Canvas.Font.Style := [];
   if Tile.Node.IsFolder then
-    Canvas.Font.Style := [TFontStyle.fsBold];
+    SetFont(Canvas, 12, [TFontStyle.fsBold])
+  else
+    SetFont(Canvas, 12);
   TextBounds := R;
   TextBounds.Inflate(-5, -2);
-  TextBounds.Bottom := Min(TextBounds.Bottom, TextBounds.Top + 19);
+  TextBounds.Bottom := Min(TextBounds.Bottom, TextBounds.Top + Scaled(19));
   Suffix := TileTitleSuffix(Tile.Node);
   if (Suffix <> '') and (Canvas.TextWidth(Suffix + '…') <= TextBounds.Width) then
     Title := Shorten(DiskNodeTitle(Tile.Node), TextBounds.Width - Canvas.TextWidth(Suffix)) + Suffix
@@ -141,11 +165,10 @@ begin
     Title := Shorten(DiskNodeTitle(Tile.Node) + Suffix, TextBounds.Width);
   if Title <> '' then
     Canvas.FillText(TextBounds, Title, False, 1, [], TTextAlign.Leading, TTextAlign.Center);
-  if (Suffix = '') and Tile.ContentBounds.IsEmpty and (R.Height >= 40) then
+  if (Suffix = '') and Tile.ContentBounds.IsEmpty and (R.Height >= Scaled(40)) then
   begin
-    TextBounds.Offset(0, 19);
-    Canvas.Font.Size := 11;
-    Canvas.Font.Style := [];
+    TextBounds.Offset(0, Scaled(19));
+    SetFont(Canvas, 11);
     Title := Shorten(FormatDiskBytes(Tile.Node.Size), TextBounds.Width);
     if Title <> '' then
       Canvas.FillText(TextBounds, Title, False, 1, [], TTextAlign.Leading, TTextAlign.Center);
@@ -168,16 +191,14 @@ begin
     Reset;
     FPaintedFocus := FContext.Focus;
     FPaintedBounds := Bounds;
-    FHeaderBounds := RectF(Bounds.Left + 4, Bounds.Top + 2, Bounds.Right - 4, Bounds.Top + 38);
+    FHeaderBounds := RectF(Bounds.Left + 4, Bounds.Top + 2, Bounds.Right - 4, Bounds.Top + 2 + Scaled(36));
     Body := RectF(Bounds.Left + 4, FHeaderBounds.Bottom + 3, Bounds.Right - 4, Bounds.Bottom - 4);
     LayoutContent(Body);
   end;
   Title := DiskNodeTitle(FContext.Focus);
   if FContext.Focus.ParentFolder <> nil then
     Title := Translate('Parent folder') + ' · ' + Title;
-  Canvas.Font.Family := 'Segoe UI';
-  Canvas.Font.Size := 13;
-  Canvas.Font.Style := [];
+  SetFont(Canvas, 13);
   Canvas.Fill.Color := FContext.Theme.Text;
   TextBounds := FHeaderBounds;
   TextBounds.Inflate(-5, 0);

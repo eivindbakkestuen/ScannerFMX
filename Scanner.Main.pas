@@ -135,6 +135,7 @@ type
     MenuItemAbout: TMenuItem;
     MenuItemFreeSpace: TMenuItem;
     MenuItemLiveScan: TMenuItem;
+    MenuItemGraphFont: TMenuItem;
     PopupMenuSettings: TPopupMenu;
     PathScanIconTemplate: TPath;
     PathStopIconTemplate: TPath;
@@ -190,6 +191,7 @@ type
     procedure MenuItemAboutClick(Sender: TObject);
     procedure MenuItemFreeSpaceClick(Sender: TObject);
     procedure MenuItemLiveScanClick(Sender: TObject);
+    procedure MenuItemGraphFontClick(Sender: TObject);
     procedure MenuItemHideClick(Sender: TObject);
     procedure MenuItemZoomClick(Sender: TObject);
     procedure MenuItemRescanClick(Sender: TObject);
@@ -233,6 +235,9 @@ type
     FVolumeOverview, FPendingOverview: Boolean;
     FIni: TMemIniFile;
     FDarkTheme: Boolean;
+    // The chart's typeface and its size in points.
+    FGraphFont: string;
+    FGraphFontSize: Integer;
     FDesignReady: Boolean;
     FSelected: TDiskNode;
     FViewNodes: TArray<TDiskNode>;
@@ -247,6 +252,7 @@ type
     procedure ExecuteNodeAction(Sender: TObject);
     procedure ExecuteSettingsAction(Sender: TObject);
     procedure SelectLanguage(const Language: string);
+    function ChooseGraphFont: Boolean;
     function ThemeColor(const Role: string): TAlphaColor;
     function ChartContext: TChartContext;
     function ChartTheme: TChartTheme;
@@ -330,9 +336,15 @@ implementation
 
 uses
   System.IOUtils, System.Generics.Defaults, System.Diagnostics, Winapi.Windows,
-  Winapi.ShellAPI, Winapi.Dwmapi, FMX.Platform.Win, Scanner.Dialog;
+  Winapi.ShellAPI, Winapi.Dwmapi, Winapi.CommDlg, FMX.Platform.Win, Scanner.Dialog;
 
 {$R *.fmx}
+
+const
+  // Points; tile text bands grow with the font, so very large sizes would
+  // leave no room for nested folders.
+  MinGraphFontSize = 6;
+  MaxGraphFontSize = 16;
 
 function TFormMain.ViewFraction(Node: TDiskNode): Double;
 begin
@@ -371,6 +383,9 @@ begin
   MenuItemFreeSpace.IsChecked := FIni.ReadBool('Appearance', 'HideFreeSpace', True);
   FViewData.ShowFreeSpace := not MenuItemFreeSpace.IsChecked;
   MenuItemLiveScan.IsChecked := FIni.ReadBool('Appearance', 'LiveScan', True);
+  FGraphFont := FIni.ReadString('Appearance', 'GraphFont', DefaultChartFontFamily);
+  FGraphFontSize := EnsureRange(FIni.ReadInteger('Appearance', 'GraphFontSize', DefaultChartFontSize),
+    MinGraphFontSize, MaxGraphFontSize);
   SetChartView('sunburst');
   FIncluded := TDictionary<string, Boolean>.Create;
   FDevices := TDictionary<string, Integer>.Create;
@@ -1988,6 +2003,8 @@ begin
   Result.HoverKind := FHoverKind;
   Result.Busy := ViewBlank;
   Result.Theme := ChartTheme;
+  Result.FontFamily := FGraphFont;
+  Result.FontScale := FGraphFontSize / DefaultChartFontSize;
 end;
 
 function TFormMain.ChartTheme: TChartTheme;
@@ -2507,6 +2524,52 @@ begin
   RefreshView;
 end;
 
+function TFormMain.ChooseGraphFont: Boolean;
+var
+  Options: TChooseFont;
+  Font: TLogFont;
+  DC: HDC;
+begin
+  Font := Default(TLogFont);
+  StrPLCopy(Font.lfFaceName, FGraphFont, Length(Font.lfFaceName) - 1);
+  DC := GetDC(0);
+  try
+    Font.lfHeight := -MulDiv(FGraphFontSize, GetDeviceCaps(DC, LOGPIXELSY), 72);
+  finally
+    ReleaseDC(0, DC);
+  end;
+  Font.lfWeight := FW_NORMAL;
+  Font.lfCharSet := DEFAULT_CHARSET;
+  Options := Default(TChooseFont);
+  Options.lStructSize := SizeOf(Options);
+  Options.hWndOwner := FormToHWND(Self);
+  Options.lpLogFont := @Font;
+  // DirectWrite draws the chart, so only outline fonts are offered. The chart
+  // picks regular or bold itself; only the family and size are used.
+  Options.Flags := CF_SCREENFONTS or CF_INITTOLOGFONTSTRUCT or CF_TTONLY or CF_NOVERTFONTS or
+    CF_NOSTYLESEL or CF_LIMITSIZE;
+  Options.nSizeMin := MinGraphFontSize;
+  Options.nSizeMax := MaxGraphFontSize;
+  Result := ChooseFont(Options);
+  if Result then
+  begin
+    FGraphFont := PChar(@Font.lfFaceName[0]);
+    FGraphFontSize := EnsureRange(Round(Options.iPointSize / 10), MinGraphFontSize, MaxGraphFontSize);
+  end;
+end;
+
+procedure TFormMain.MenuItemGraphFontClick(Sender: TObject);
+begin
+  if not ChooseGraphFont then
+    Exit;
+  FIni.WriteString('Appearance', 'GraphFont', FGraphFont);
+  FIni.WriteInteger('Appearance', 'GraphFontSize', FGraphFontSize);
+  FIni.UpdateFile;
+  // Tile layouts size their text bands from the font.
+  FChartView.Reset;
+  PaintBoxChart.Repaint;
+end;
+
 procedure TFormMain.MenuItemHideClick(Sender: TObject);
 begin
   ExecuteNodeAction(Sender);
@@ -2561,6 +2624,7 @@ begin
   MenuItemAbout.Text := Translate('About Scanner');
   MenuItemFreeSpace.Text := Translate('Don''t draw free space');
   MenuItemLiveScan.Text := Translate('Show results while scanning');
+  MenuItemGraphFont.Text := Translate('Select graph font…');
   SpeedButtonUp.Hint := Translate('Parent folder (Alt+Up)');
   SpeedButtonBack.Hint := Translate('Back (Alt+Left)');
   MenuItemInclude.Text := Translate('Include in summary');

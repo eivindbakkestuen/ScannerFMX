@@ -123,19 +123,17 @@ begin
     end;
     Canvas.DrawPath(Path, 1);
     if not Highlight and (Segment.Node is TSmallFileGroup) and
-      (Segment.SweepAngle >= 50) and (Segment.OuterRadius - Segment.InnerRadius >= 44) then
+      (Segment.SweepAngle >= 50) and (Segment.OuterRadius - Segment.InnerRadius >= Scaled(44)) then
     begin
       LabelPoint := P((Segment.InnerRadius + Segment.OuterRadius) / 2,
         Segment.StartAngle + Segment.SweepAngle / 2);
       Canvas.Fill.Color := FContext.Theme.Text;
-      Canvas.Font.Family := 'Segoe UI';
-      Canvas.Font.Style := [];
-      Canvas.Font.Size := 13;
-      Canvas.FillText(RectF(LabelPoint.X - 70, LabelPoint.Y - 20,
-          LabelPoint.X + 70, LabelPoint.Y + 2), Translate('Small files'), False, 1, [], TTextAlign.Center);
-      Canvas.Font.Size := 11;
-      Canvas.FillText(RectF(LabelPoint.X - 70, LabelPoint.Y + 2,
-          LabelPoint.X + 70, LabelPoint.Y + 20), FileCountText(Segment.Node.Files),
+      SetFont(Canvas, 13);
+      Canvas.FillText(RectF(LabelPoint.X - Scaled(70), LabelPoint.Y - Scaled(20),
+          LabelPoint.X + Scaled(70), LabelPoint.Y + Scaled(2)), Translate('Small files'), False, 1, [], TTextAlign.Center);
+      SetFont(Canvas, 11);
+      Canvas.FillText(RectF(LabelPoint.X - Scaled(70), LabelPoint.Y + Scaled(2),
+          LabelPoint.X + Scaled(70), LabelPoint.Y + Scaled(20)), FileCountText(Segment.Node.Files),
         False, 1, [], TTextAlign.Center);
     end;
   finally
@@ -323,9 +321,7 @@ var
 
 begin
   FFreeSpaceLabel := Default(TFreeSpaceLabel);
-  Canvas.Font.Family := 'Segoe UI';
-  Canvas.Font.Size := 13;
-  Canvas.Font.Style := [];
+  SetFont(Canvas, 13);
   for Segment in FSegments do
     if Segment.Node.IsFree then
     begin
@@ -344,9 +340,7 @@ procedure TSunburstChartView.PaintFreeSpaceLabel(Canvas: TCanvas);
 begin
   if FFreeSpaceLabel.Placement = fslNone then
     Exit;
-  Canvas.Font.Family := 'Segoe UI';
-  Canvas.Font.Size := 13;
-  Canvas.Font.Style := [];
+  SetFont(Canvas, 13);
   Canvas.Fill.Color := FContext.Theme.Text;
   Canvas.FillText(FFreeSpaceLabel.Bounds, FFreeSpaceLabel.Text, False, 1, [],
     TTextAlign.Center, TTextAlign.Center);
@@ -394,26 +388,23 @@ begin
   Canvas.Fill.Color := FContext.Theme.Background;
   Canvas.FillEllipse(CenterR, 1);
   Canvas.Fill.Color := FContext.Theme.Text;
-  Canvas.Font.Family := 'Segoe UI';
-  Canvas.Font.Size := 14;
-  Canvas.Font.Style := [];
+  SetFont(Canvas, 14);
   Title := DiskNodeTitle(FContext.Focus);
   if FContext.Focus.IsVolume then
     Title := Format(Translate('Disk %s'), [ExtractFileDrive(FContext.Focus.Path)]);
-  TextR := RectF(CenterR.Left + 6, FCenter.Y - 36, CenterR.Right - 6, FCenter.Y - 12);
+  TextR := RectF(CenterR.Left + 6, FCenter.Y - Scaled(36), CenterR.Right - 6, FCenter.Y - Scaled(12));
   Canvas.FillText(TextR, Title, False, 1, [], TTextAlign.Center, TTextAlign.Center);
   if FContext.Focus.IsVolume and (FContext.Focus.Capacity > 0) then
     NumberText := FormatDiskBytes(FContext.Focus.Capacity)
   else
     NumberText := FormatDiskBytes(FContext.Focus.Size);
-  Canvas.Font.Size := Min(28, FCenterRadius / 3.1);
-  Canvas.Font.Style := [TFontStyle.fsBold];
-  TextR := RectF(CenterR.Left + 4, FCenter.Y - 12, CenterR.Right - 4, FCenter.Y + 25);
+  SetFont(Canvas, 28, [TFontStyle.fsBold]);
+  Canvas.Font.Size := Min(Canvas.Font.Size, FCenterRadius / 3.1);
+  TextR := RectF(CenterR.Left + 4, FCenter.Y - Scaled(12), CenterR.Right - 4, FCenter.Y + Scaled(25));
   Canvas.FillText(TextR, NumberText, False, 1, [], TTextAlign.Center, TTextAlign.Center);
-  Canvas.Font.Size := 13;
-  Canvas.Font.Style := [];
+  SetFont(Canvas, 13);
   Canvas.Fill.Color := FContext.Theme.Muted;
-  TextR := RectF(CenterR.Left + 4, FCenter.Y + 27, CenterR.Right - 4, FCenter.Y + 47);
+  TextR := RectF(CenterR.Left + 4, FCenter.Y + Scaled(27), CenterR.Right - 4, FCenter.Y + Scaled(47));
   if FContext.Focus.IsVolume and (FContext.Focus.Capacity > 0) then
     Title := Translate('total')
   else

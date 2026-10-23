@@ -103,9 +103,9 @@ var
   Depth: Integer;
 begin
   // Keep rows readable; deeper levels can be reached by opening a folder.
-  FMaxDepth := Max(1, Min(12, Trunc(Bounds.Height / 24)));
+  FMaxDepth := Max(1, Min(12, Trunc(Bounds.Height / Scaled(24))));
   Depth := Max(1, VisibleDepth(FContext.Focus, Bounds.Width, 0));
-  FRowHeight := Min(72, Bounds.Height / Depth);
+  FRowHeight := Min(Scaled(72), Bounds.Height / Depth);
   LayoutLevel(FContext.Focus, Bounds, 1);
 end;
 

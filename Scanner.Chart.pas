@@ -27,6 +27,9 @@ type
     HoverPoint: TPointF;
     HoverKind: TChartHitKind;
     Theme: TChartTheme;
+    // Chart text uses FontFamily; FontScale sizes it and the bands that hold it.
+    FontFamily: string;
+    FontScale: Single;
     Busy: Boolean;
   end;
 
@@ -35,6 +38,8 @@ type
     procedure PaintTooltip(Canvas: TCanvas; const Bounds: TRectF);
   protected
     FContext: TChartContext;
+    procedure SetFont(Canvas: TCanvas; Size: Single; Style: TFontStyles = []);
+    function Scaled(Value: Single): Single;
     procedure DoPaint(Canvas: TCanvas; const Bounds: TRectF); virtual; abstract;
   public
     constructor Create; virtual;
@@ -62,6 +67,11 @@ type
     class function CreateView(const ID: string): TDiskChartView;
     class function Views: TArray<TChartViewInfo>;
   end;
+
+const
+  DefaultChartFontFamily = 'Segoe UI';
+  // Points; the chart's sizes are designed for this and scale from it.
+  DefaultChartFontSize = 9;
 
 function ChartNodeColor(Data: TDiskViewModel; Focus, Node: TDiskNode; Depth: Integer; const Theme: TChartTheme): TAlphaColor;
 
@@ -114,6 +124,24 @@ begin
   inherited;
 end;
 
+procedure TDiskChartView.SetFont(Canvas: TCanvas; Size: Single; Style: TFontStyles);
+begin
+  if FContext.FontFamily <> '' then
+    Canvas.Font.Family := FContext.FontFamily
+  else
+    Canvas.Font.Family := DefaultChartFontFamily;
+  Canvas.Font.Size := Scaled(Size);
+  Canvas.Font.Style := Style;
+end;
+
+function TDiskChartView.Scaled(Value: Single): Single;
+begin
+  if FContext.FontScale > 0 then
+    Result := Value * FContext.FontScale
+  else
+    Result := Value;
+end;
+
 procedure TDiskChartView.Paint(Canvas: TCanvas; const Bounds: TRectF; const Context: TChartContext);
 var
   State: TCanvasSaveState;
@@ -128,8 +156,7 @@ begin
     if Context.Busy or (Context.Focus = nil) then
     begin
       Reset;
-      Canvas.Font.Family := 'Segoe UI';
-      Canvas.Font.Size := 15;
+      SetFont(Canvas, 15);
       Canvas.Fill.Color := Context.Theme.Muted;
       Title := Translate('Select a drive or folder');
       if Context.Busy then
@@ -211,9 +238,7 @@ begin
   end;
   State := Canvas.SaveState;
   try
-    Canvas.Font.Family := 'Segoe UI';
-    Canvas.Font.Size := 14;
-    Canvas.Font.Style := [];
+    SetFont(Canvas, 14);
     LineHeight := Ceil(Max(Canvas.TextHeight(NameText), Canvas.TextHeight(SizeText)));
     W := Min(Max(Canvas.TextWidth(NameText), Canvas.TextWidth(SizeText)) + 2 * Padding,
       Bounds.Width - 2 * Padding);

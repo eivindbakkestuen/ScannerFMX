@@ -47,11 +47,11 @@ begin
   Tile.ContentBounds := TRectF.Empty;
   // Preserve the folder's header as a click target; descendants occupy its body.
   if Node.IsFolder and not Node.Hidden and (Depth < 8) and
-    (Bounds.Width >= 56) and (Bounds.Height >= 56) and (Node.Size > 0) then
+    (Bounds.Width >= 56) and (Bounds.Height >= 34 + Scaled(22)) and (Node.Size > 0) then
   begin
     Tile.ContentBounds := Bounds;
     Tile.ContentBounds.Inflate(-3, -3);
-    Tile.ContentBounds.Top := Tile.ContentBounds.Top + 22;
+    Tile.ContentBounds.Top := Tile.ContentBounds.Top + Scaled(22);
   end;
   FTiles.Add(Tile);
   if not Tile.ContentBounds.IsEmpty then
@@ -64,7 +64,7 @@ var
   Items: TList<TDiskNode>;
   Areas: TArray<Double>;
   Remaining, TileBounds: TRectF;
-  Total, Area, Sum, Side, Thickness, Offset, Weight: Double;
+  Total, Area, Sum, Side, Thickness, Offset, Next, Weight: Double;
   First, Last, i: Integer;
 
   function Worst(Start, Finish: Integer; Edge: Double): Double;
@@ -158,22 +158,25 @@ begin
       Offset := 0;
       for i := First to Last do
       begin
+        // A tile ends exactly where the next one starts, so pixel snapping at
+        // paint time keeps them touching.
+        Next := Offset + Areas[i] / Thickness;
         if Remaining.Width >= Remaining.Height then
         begin
           TileBounds := RectF(Remaining.Left, Remaining.Top + Offset,
-            Min(Remaining.Right, Remaining.Left + Thickness), Remaining.Top + Offset + Areas[i] / Thickness);
+            Min(Remaining.Right, Remaining.Left + Thickness), Remaining.Top + Next);
           if i = Last then
             TileBounds.Bottom := Remaining.Bottom;
         end
         else
         begin
           TileBounds := RectF(Remaining.Left + Offset, Remaining.Top,
-            Remaining.Left + Offset + Areas[i] / Thickness, Min(Remaining.Bottom, Remaining.Top + Thickness));
+            Remaining.Left + Next, Min(Remaining.Bottom, Remaining.Top + Thickness));
           if i = Last then
             TileBounds.Right := Remaining.Right;
         end;
         AddTile(Items[i], TileBounds, Depth);
-        Offset := Offset + Areas[i] / Thickness;
+        Offset := Next;
       end;
       if Remaining.Width >= Remaining.Height then
         Remaining.Left := Min(Remaining.Right, Remaining.Left + Thickness)
