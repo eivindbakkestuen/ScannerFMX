@@ -4,21 +4,29 @@ interface
 
 uses
   System.SysUtils, System.Types, System.UITypes, System.Classes, System.Math,
-  System.Generics.Collections, System.IniFiles, FMX.Types, FMX.Controls,
+  System.Generics.Collections, System.IniFiles, System.Messaging, FMX.Types, FMX.Controls,
   FMX.Forms, FMX.Graphics, FMX.Dialogs, FMX.Layouts, FMX.Objects, FMX.StdCtrls,
   FMX.Controls.Presentation, FMX.Menus, FMX.Ani, Scanner.Model,
   Scanner.ViewModel, Scanner.Chart, Scanner.DriveButton, Scanner.FolderItem,
   Scanner.Localization;
 
 type
-  TViewState = record
-    Node: TDiskNode;
-    Overview: Boolean;
-  end;
-
+  // History is kept as paths: previews and merges replace the nodes.
   TViewPath = record
     Path: string;
     Overview: Boolean;
+  end;
+
+  // UI references kept as paths while a merge replaces part of the tree.
+  TSavedView = record
+    HasFocus: Boolean;
+    Focus, Selected, Context: string;
+  end;
+
+  TScanStatus = record
+    Current, Waiting: string;
+    Visited: UInt64;
+    Position: Integer;
   end;
 
   TFormMain = class(TForm)
@@ -125,6 +133,8 @@ type
     MenuItemApps: TMenuItem;
     MenuItemTrash: TMenuItem;
     MenuItemAbout: TMenuItem;
+    MenuItemFreeSpace: TMenuItem;
+    MenuItemLiveScan: TMenuItem;
     PopupMenuSettings: TPopupMenu;
     PathScanIconTemplate: TPath;
     PathStopIconTemplate: TPath;
@@ -178,6 +188,8 @@ type
     procedure MenuItemAppsClick(Sender: TObject);
     procedure MenuItemTrashClick(Sender: TObject);
     procedure MenuItemAboutClick(Sender: TObject);
+    procedure MenuItemFreeSpaceClick(Sender: TObject);
+    procedure MenuItemLiveScanClick(Sender: TObject);
     procedure MenuItemHideClick(Sender: TObject);
     procedure MenuItemZoomClick(Sender: TObject);
     procedure MenuItemRescanClick(Sender: TObject);
@@ -185,23 +197,40 @@ type
     procedure MenuItemRecycleClick(Sender: TObject);
     procedure MenuItemRemoveClick(Sender: TObject);
   private
-    FRoot, FFocus, FHover, FContext: TDiskNode;
-    FWorker: TScanThread;
-    FRetiredWorkers: TObjectList<TScanThread>;
-    FHistory: TList<TViewState>;
+    // FRoot is the summary of included drives; FOther holds every other scan
+    // root (excluded drives and chosen folders). Both live for the whole session.
+    FRoot, FOther, FFocus, FHover, FContext: TDiskNode;
+    FScans: TScanScheduler;
+    FSkippedByRoot: TDictionary<string, Integer>;
+    // Roots that are a running fresh scan's preview. They are never borrowed
+    // by a scan, and are dropped if their scan stops before finishing.
+    FProvisional: TDictionary<string, Boolean>;
+    FHistory: TList<TViewPath>;
     FViewData: TDiskViewModel;
     FChartView: TDiskChartView;
     FChartViewID: string;
     FHoverKind: TChartHitKind;
-    FDrives, FScanPaths: TArray<string>;
+    FDrives: TArray<string>;
+    // The folder list shows FRowNodes through a few recycled rows, laid over a
+    // spacer as tall as the whole list. FPressedPath is the item under the
+    // mouse button, in case a preview re-binds its row before the click.
+    FRows: TList<TFrameFolderItem>;
+    FRowNodes: TArray<TDiskNode>;
+    FRowSpacer: TLayout;
+    FRowHeight: Single;
+    FPressedPath: string;
     FIncluded: TDictionary<string, Boolean>;
     FDevices: TDictionary<string, Integer>;
+    // Drives on a disk without a seek penalty (SSDs).
+    FSolidState: TDictionary<string, Boolean>;
     FDriveContext: string;
-    FStartFolder, FPendingPath, FReplacePath, FViewPath: string;
+    // A location shown before its results exist; FPendingRoot names its job.
+    FStartFolder, FPendingPath, FPendingRoot: string;
     FHoverPoint: TPointF;
-    FSkipped: Integer;
-    FClosing, FRootIsSummary, FIncomingSummary: Boolean;
-    FVolumeOverview, FPendingOverview, FViewOverview: Boolean;
+    FClosing: Boolean;
+    FBeforeShownId: Int64;
+    FPlacementRestored: Boolean;
+    FVolumeOverview, FPendingOverview: Boolean;
     FIni: TMemIniFile;
     FDarkTheme: Boolean;
     FDesignReady: Boolean;
@@ -210,6 +239,10 @@ type
 
     FBackground, FPanelColor, FTextColor, FMutedColor, FBorderColor: TAlphaColor;
     procedure ApplicationException(Sender: TObject; E: Exception);
+    procedure FormBeforeShown(const Sender: TObject; const M: System.Messaging.TMessage);
+    procedure FormMainClose(Sender: TObject; var Action: TCloseAction);
+    procedure RestorePlacement;
+    procedure SavePlacement;
     procedure ExecuteUICommand(Sender: TObject);
     procedure ExecuteNodeAction(Sender: TObject);
     procedure ExecuteSettingsAction(Sender: TObject);
@@ -224,6 +257,11 @@ type
     procedure ReleaseChildCapture(Container: TFmxObject);
     procedure ClearFolderRows;
     procedure BuildFolderRows;
+    procedure EnsureRows(Count: Integer);
+    procedure BindRows;
+    procedure FolderRowsViewportChange(Sender: TObject; const OldViewportPosition, NewViewportPosition: TPointF;
+      const ContentSizeChanged: Boolean);
+    procedure FolderRowsResize(Sender: TObject);
     procedure UpdateSelection(Node: TDiskNode);
     procedure PopupNode(Node: TDiskNode; const ScreenPoint: TPointF);
     function NodeColor(Node: TDiskNode; Depth: Integer = 1): TAlphaColor;
@@ -231,9 +269,37 @@ type
     function NodeTitle(Node: TDiskNode): string;
     function FolderCount(Node: TDiskNode): UInt64;
     function RootNeedsZoom(Node: TDiskNode): Boolean;
-    procedure StartScan(const Paths: TArray<string>; const FocusPath: string = ''; const ReplacePath: string = '');
-    procedure CancelScan;
-    procedure ReapWorkers;
+    function ContainerFor(const RootPath: string): TDiskNode;
+    function FindRoot(const RootPath: string): TDiskNode;
+    function FindScanned(const Path: string): TDiskNode;
+    function RootOf(Node: TDiskNode): TDiskNode;
+    procedure InsertRoot(Container, Node: TDiskNode);
+    procedure DropRoot(Root: TDiskNode);
+    procedure ArrangeRoots;
+    function LaneFor(const RootPath: string): string;
+    function EnqueueScan(const RootPath, Path: string): TScanJob;
+    function CreateScanWorker(Job: TScanJob): TScanThread;
+    procedure MergeJob(Job: TScanJob; Errors: TStrings);
+    function IsProvisional(Root: TDiskNode): Boolean;
+    procedure RequestPreviews;
+    procedure InstallPreview(Job: TScanJob; Preview: TDiskNode);
+    procedure ResolvePending(const RootPath: string; Final: Boolean);
+    function SaveView: TSavedView;
+    function FindNearest(const Path: string): TDiskNode;
+    procedure RestoreView(const View: TSavedView);
+    procedure ResetViewCaches;
+    procedure RefreshView;
+    function ViewJobs: TArray<TScanJob>;
+    function ViewBusy: Boolean;
+    function ViewBlank: Boolean;
+    function ViewScanStatus: TScanStatus;
+    function ViewSkipped: Integer;
+    procedure StopViewScans;
+    procedure SetPending(const Path, RootPath: string; Overview: Boolean);
+    procedure OpenLocation(const Path: string);
+    procedure ShowSummary;
+    procedure ScanDrives(Refresh: Boolean);
+    procedure RescanRecycleBins;
     procedure UpdateScanStatus;
     procedure ShowNode(Node: TDiskNode);
     procedure UpdateButtons;
@@ -242,7 +308,6 @@ type
     procedure UpdateChartViewButtons;
     procedure SpeedButtonDriveClick(Sender: TObject);
     procedure SpeedButtonDriveMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
-    procedure ScanSummary;
     procedure Rescan(Node: TDiskNode);
     function FindPath(Node: TDiskNode; const Path: string): TDiskNode;
     procedure ChooseFolder;
@@ -264,8 +329,8 @@ var
 implementation
 
 uses
-  System.IOUtils, Winapi.Windows, Winapi.ShellAPI, Winapi.Dwmapi,
-  FMX.Platform.Win, Scanner.Dialog;
+  System.IOUtils, System.Generics.Defaults, System.Diagnostics, Winapi.Windows,
+  Winapi.ShellAPI, Winapi.Dwmapi, FMX.Platform.Win, Scanner.Dialog;
 
 {$R *.fmx}
 
@@ -277,7 +342,7 @@ end;
 procedure TFormMain.FormMainCreate(Sender: TObject);
 var
   P, DefaultLanguage: string;
-  i: Integer;
+  i, MaxDevice, Disk: Integer;
   Item: TMenuItem;
 begin
   if (GetUserDefaultUILanguage and $3FF) = $19 then
@@ -285,26 +350,52 @@ begin
   else
     DefaultLanguage := 'en';
   Application.OnException := ApplicationException;
+  OnClose := FormMainClose;
+  FBeforeShownId := TMessageManager.DefaultManager.SubscribeToMessage(TFormBeforeShownMessage, FormBeforeShown);
+  FRoot := TDiskNode.Create('', 'Summary');
+  FOther := TDiskNode.Create('', 'Other');
+  FScans := TScanScheduler.Create;
+  FSkippedByRoot := TDictionary<string, Integer>.Create(TIStringComparer.Ordinal);
+  FProvisional := TDictionary<string, Boolean>.Create(TIStringComparer.Ordinal);
+  FRows := TList<TFrameFolderItem>.Create;
+  FRowSpacer := TLayout.Create(Self);
+  FRowSpacer.HitTest := False;
+  FRowSpacer.Parent := VertScrollBoxFolders;
+  VertScrollBoxFolders.OnViewportPositionChange := FolderRowsViewportChange;
+  VertScrollBoxFolders.OnResize := FolderRowsResize;
   FIni := TMemIniFile.Create(TPath.Combine(TPath.GetHomePath, 'ScannerFMX.ini'), TEncoding.UTF8);
   SetLanguage(FIni.ReadString('Appearance', 'Language', DefaultLanguage));
-  FRetiredWorkers := TObjectList<TScanThread>.Create(True);
-  FHistory := TList<TViewState>.Create;
+  FHistory := TList<TViewPath>.Create;
   FViewData := TDiskViewModel.Create;
+  // Drive layouts leave out free space unless the user turns it back on.
+  MenuItemFreeSpace.IsChecked := FIni.ReadBool('Appearance', 'HideFreeSpace', True);
+  FViewData.ShowFreeSpace := not MenuItemFreeSpace.IsChecked;
+  MenuItemLiveScan.IsChecked := FIni.ReadBool('Appearance', 'LiveScan', True);
   SetChartView('sunburst');
   FIncluded := TDictionary<string, Boolean>.Create;
   FDevices := TDictionary<string, Integer>.Create;
+  FSolidState := TDictionary<string, Boolean>.Create;
   FDrives := AvailableDrives;
+  MaxDevice := 7;
   for P in FDrives do
   begin
     FIncluded.Add(P, FIni.ReadBool('Summary', P, GetDriveType(PChar(P)) = DRIVE_FIXED));
-    FDevices.Add(P, FIni.ReadInteger('PhysicalDevice', P, 0));
+    // The disk Windows reports, unless the user picked a device ID.
+    Disk := VolumeDisk(P);
+    FDevices.Add(P, FIni.ReadInteger('PhysicalDevice', P, Disk));
+    FSolidState.Add(P, (Disk >= 0) and not DiskSeeks(Disk));
+    MaxDevice := Max(MaxDevice, FDevices[P]);
   end;
-  for i := 0 to 7 do
+  // Tag -1 is Automatic: forget the picked ID and use the detected disk again.
+  for i := -1 to MaxDevice do
   begin
     Item := TMenuItem.Create(Self);
     Item.Text := i.ToString;
     Item.Tag := i;
-    Item.StyleLookup := 'menudevice' + i.ToString + 'style';
+    if (i >= 0) and (i <= 7) then
+      Item.StyleLookup := 'menudevice' + i.ToString + 'style'
+    else
+      Item.StyleLookup := 'menuitemstyle';
     Item.RadioItem := True;
     Item.GroupIndex := 1;
     Item.OnClick := MenuItemPhysicalClick;
@@ -319,136 +410,788 @@ begin
   if ParamCount > 0 then
     FStartFolder := ExpandFileName(ParamStr(1));
   if FStartFolder <> '' then
-    StartScan([FStartFolder], FStartFolder)
+    OpenLocation(FStartFolder)
   else
-    ScanSummary;
+    ShowSummary;
+end;
+
+// The monitor arrangement in physical pixels, e.g. '2560x1440@0,0
+// 1920x1080@2560,180'. The primary monitor is at 0,0, so this also tells
+// which one is primary.
+function MonitorLayout: string;
+var
+  Monitors: TList<TRect>;
+  R: TRect;
+  i: Integer;
+begin
+  Screen.UpdateDisplayInformation;
+  Monitors := TList<TRect>.Create;
+  try
+    for i := 0 to Screen.DisplayCount - 1 do
+      Monitors.Add(Screen.Displays[i].PhysicalBounds);
+    Monitors.Sort(TComparer<TRect>.Construct(
+      function(const A, B: TRect): Integer
+      begin
+        Result := CompareValue(A.Left, B.Left);
+        if Result = 0 then
+          Result := CompareValue(A.Top, B.Top);
+      end));
+    Result := '';
+    for R in Monitors do
+      Result := Result + Format(' %dx%d@%d,%d', [R.Width, R.Height, R.Left, R.Top]);
+    Result := Trim(Result);
+  finally
+    Monitors.Free;
+  end;
+end;
+
+function OnSomeMonitor(const Bounds: TRect): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to Screen.DisplayCount - 1 do
+    if Screen.Displays[i].PhysicalWorkarea.IntersectsWith(Bounds) then
+      Exit(True);
+  Result := False;
+end;
+
+procedure TFormMain.FormBeforeShown(const Sender: TObject; const M: System.Messaging.TMessage);
+begin
+  // FMX has placed the form (centred) but not shown it yet.
+  if (TFormBeforeShownMessage(M).Value = Self) and not FPlacementRestored then
+  begin
+    FPlacementRestored := True;
+    RestorePlacement;
+  end;
+end;
+
+procedure TFormMain.RestorePlacement;
+var
+  Placement: TWindowPlacement;
+  Bounds: TRect;
+  Section: string;
+begin
+  // Each monitor layout keeps its own placement; a layout not seen before
+  // keeps the designed centring.
+  Section := 'Window ' + MonitorLayout;
+  if not FIni.SectionExists(Section) then
+    Exit;
+  Bounds := TRect.Create(FIni.ReadInteger(Section, 'Left', 0), FIni.ReadInteger(Section, 'Top', 0),
+    FIni.ReadInteger(Section, 'Right', 0), FIni.ReadInteger(Section, 'Bottom', 0));
+  if Bounds.IsEmpty or not OnSomeMonitor(Bounds) then
+    Exit;
+  // The window is still hidden; FMX shows it, maximized if WindowState says so.
+  Placement := Default(TWindowPlacement);
+  Placement.length := SizeOf(Placement);
+  Placement.showCmd := SW_HIDE;
+  Placement.rcNormalPosition := Bounds;
+  if SetWindowPlacement(FormToHWND(Self), Placement) and FIni.ReadBool(Section, 'Maximized', False) then
+    WindowState := TWindowState.wsMaximized;
+end;
+
+procedure TFormMain.SavePlacement;
+var
+  Placement: TWindowPlacement;
+  Section: string;
+begin
+  Placement := Default(TWindowPlacement);
+  Placement.length := SizeOf(Placement);
+  if not GetWindowPlacement(FormToHWND(Self), Placement) then
+    Exit;
+  Section := 'Window ' + MonitorLayout;
+  // The normal-state bounds, so a maximized window also restores to them.
+  FIni.WriteInteger(Section, 'Left', Placement.rcNormalPosition.Left);
+  FIni.WriteInteger(Section, 'Top', Placement.rcNormalPosition.Top);
+  FIni.WriteInteger(Section, 'Right', Placement.rcNormalPosition.Right);
+  FIni.WriteInteger(Section, 'Bottom', Placement.rcNormalPosition.Bottom);
+  // A minimized window reopens in the state it was minimized from.
+  FIni.WriteBool(Section, 'Maximized', (Placement.showCmd = SW_SHOWMAXIMIZED) or
+    ((Placement.showCmd = SW_SHOWMINIMIZED) and (Placement.flags and WPF_RESTORETOMAXIMIZED <> 0)));
+  FIni.UpdateFile;
+end;
+
+procedure TFormMain.FormMainClose(Sender: TObject; var Action: TCloseAction);
+begin
+  SavePlacement;
 end;
 
 procedure TFormMain.FormMainDestroy(Sender: TObject);
-var
-  Worker: TScanThread;
 begin
   FClosing := True;
+  TMessageManager.DefaultManager.Unsubscribe(TFormBeforeShownMessage, FBeforeShownId);
   Application.OnException := nil;
   FSelected := nil;
   TimerPoll.Enabled := False;
-  CancelScan;
-  for Worker in FRetiredWorkers do
-    Worker.RequestCancel;
-  FRetiredWorkers.Free;
+  // Join every worker before freeing the tree they borrow.
+  FScans.Free;
   FChartView.Free;
   FViewData.Free;
   FRoot.Free;
+  FOther.Free;
+  FSkippedByRoot.Free;
+  FProvisional.Free;
+  FRows.Free;
   FHistory.Free;
   FIncluded.Free;
   FDevices.Free;
+  FSolidState.Free;
   FIni.Free;
 end;
 
-procedure TFormMain.CancelScan;
+function IsDriveRoot(const Path: string): Boolean;
 begin
-  if FWorker <> nil then
+  Result := SameText(IncludeTrailingPathDelimiter(Path), ExtractFileDrive(Path) + '\');
+end;
+
+function PathOfNode(Node: TDiskNode): string;
+begin
+  // Synthetic entries belong to the view model and are rebuilt with it.
+  if (Node = nil) or (Node is TSmallFileGroup) or (Node is TUnscannedSpace) or Node.IsFree or Node.IsUsed then
+    Result := ''
+  else
+    Result := Node.Path;
+end;
+
+function RootKey(const Path: string): string;
+begin
+  Result := ExcludeTrailingPathDelimiter(Path);
+end;
+
+function UsedBytes(const Drive: string): UInt64;
+var
+  Available, Total, FreeBytes: Int64;
+begin
+  Result := 0;
+  // Like the drive list, never wake removable or remote devices from the UI.
+  if GetDriveType(PChar(Drive)) = DRIVE_FIXED then
+    if GetDiskFreeSpaceEx(PChar(Drive), Available, Total, @FreeBytes) then
+      Result := UInt64(Max(Int64(0), Total - FreeBytes));
+end;
+
+function TFormMain.ContainerFor(const RootPath: string): TDiskNode;
+var
+  Included: Boolean;
+begin
+  Result := FOther;
+  if IsDriveRoot(RootPath) and FIncluded.TryGetValue(IncludeTrailingPathDelimiter(RootPath), Included) and Included then
+    Result := FRoot;
+end;
+
+function TFormMain.FindRoot(const RootPath: string): TDiskNode;
+var
+  Container, Node: TDiskNode;
+begin
+  for Container in TArray<TDiskNode>.Create(FRoot, FOther) do
+    for Node in Container.Children do
+      if SamePath(Node.Path, RootPath) then
+        Exit(Node);
+  Result := nil;
+end;
+
+function TFormMain.FindScanned(const Path: string): TDiskNode;
+begin
+  if Path = '' then
+    Exit(FRoot);
+  // Drives are searched before chosen folders, so a drive's own node wins.
+  Result := FindPath(FRoot, Path);
+  if Result = nil then
+    Result := FindPath(FOther, Path);
+end;
+
+function TFormMain.RootOf(Node: TDiskNode): TDiskNode;
+begin
+  Result := nil;
+  while (Node <> nil) and (Node <> FRoot) and (Node <> FOther) do
   begin
-    FWorker.RequestCancel;
-    if not FWorker.StartRequested then
-      FWorker.Start;
-    FRetiredWorkers.Add(FWorker);
-    FWorker := nil;
+    Result := Node;
+    Node := Node.Parent;
   end;
-  LayoutScanStatus.Visible := False;
-  if not FClosing then
-    UpdateButtons;
-  if not FClosing then
-    PaintBoxChart.Repaint;
-  if not FClosing then
-    TimerPoll.Enabled := True;
+  if Node = nil then
+    Result := nil;
 end;
 
-procedure TFormMain.ReapWorkers;
+procedure TFormMain.InsertRoot(Container, Node: TDiskNode);
 var
-  i: Integer;
+  Index: NativeInt;
 begin
-  for i := FRetiredWorkers.Count - 1 downto 0 do
-    if FRetiredWorkers[i].Finished then
-      FRetiredWorkers.Delete(i)
-    else
-      FRetiredWorkers[i].RequestCancel;
-end;
-
-procedure TFormMain.StartScan(const Paths: TArray<string>; const FocusPath, ReplacePath: string);
-var
-  IDs: TArray<Integer>;
-  i: Integer;
-  Volumes: TArray<string>;
-  Ancestor: TDiskNode;
-begin
-  CancelScan;
-  FSelected := nil;
-  FViewNodes := nil;
-  ClearFolderRows;
-  FIncomingSummary := False;
-  FReplacePath := ReplacePath;
-  FViewPath := '';
-  FViewOverview := FVolumeOverview;
-  if FFocus <> nil then
-    FViewPath := FFocus.Path;
-  if ReplacePath = '' then
-    FScanPaths := Copy(Paths);
-  FPendingPath := FocusPath;
-  FPendingOverview := (ReplacePath = '') and (Length(Paths) = 1) and
-    SameText(IncludeTrailingPathDelimiter(FocusPath), ExtractFileDrive(FocusPath) + '\');
-  if ReplacePath <> '' then
-    FPendingOverview := FViewOverview;
-  FHover := nil;
-  FHoverKind := chkNone;
-  FContext := nil;
-  LayoutScanStatus.Visible := True;
-  LabelScan.Text := Translate('Scanning…');
-  ProgressBarScan.Value := 0;
-  ProgressBarScan.Visible := True;
-  SetLength(IDs, Length(Paths));
-  for i := 0 to High(Paths) do
-    if not FDevices.TryGetValue(Paths[i], IDs[i]) then
-      IDs[i] := 0;
-  Volumes := nil;
-  if ReplacePath <> '' then
+  // Drives keep letter order ahead of chosen folders.
+  Index := Container.Children.Count;
+  if IsDriveRoot(Node.Path) then
   begin
-    Ancestor := FindPath(FRoot, ReplacePath);
-    while Ancestor <> nil do
+    Index := 0;
+    while (Index < Container.Children.Count) and IsDriveRoot(Container.Children[Index].Path) and
+      (CompareText(Container.Children[Index].Path, Node.Path) < 0) do
+      Inc(Index);
+  end;
+  Node.Parent := Container;
+  Container.Children.Insert(Index, Node);
+end;
+
+procedure TFormMain.DropRoot(Root: TDiskNode);
+var
+  View: TSavedView;
+  Container: TDiskNode;
+begin
+  View := SaveView;
+  ResetViewCaches;
+  FSkippedByRoot.Remove(RootKey(Root.Path));
+  Container := Root.Parent;
+  Container.Children.Remove(Root);
+  Container.Recalculate;
+  RestoreView(View);
+end;
+
+procedure TFormMain.ArrangeRoots;
+var
+  Container, Target, Node, Drive: TDiskNode;
+  i: NativeInt;
+  Moved: Boolean;
+  Key: string;
+begin
+  // A preview whose scan stopped before finishing is incomplete.
+  for Key in FProvisional.Keys.ToArray do
+    if FScans.Find(Key) = nil then
     begin
-      if Ancestor.IsVolume and (Ancestor.Capacity > 0) then
-        Volumes := Volumes + [Ancestor.Path];
-      Ancestor := Ancestor.Parent;
+      FProvisional.Remove(Key);
+      Node := FindRoot(Key);
+      if Node <> nil then
+      begin
+        DropRoot(Node);
+        RefreshView;
+      end;
+    end;
+  // Roots move only while no scan borrows them, so this can lag a running scan.
+  Moved := False;
+  for Container in TArray<TDiskNode>.Create(FRoot, FOther) do
+    for i := Container.Children.Count - 1 downto 0 do
+    begin
+      Node := Container.Children[i];
+      Target := ContainerFor(Node.Path);
+      if (Target <> Container) and (IsProvisional(Node) or not FScans.Borrows(Node.Path)) then
+      begin
+        Container.Children.Extract(Node);
+        InsertRoot(Target, Node);
+        Moved := True;
+      end;
+    end;
+  if Moved then
+  begin
+    ResetViewCaches;
+    FRoot.Recalculate;
+    FOther.Recalculate;
+    RefreshView;
+  end;
+  // A chosen folder is redundant once its drive has been scanned.
+  for i := FOther.Children.Count - 1 downto 0 do
+  begin
+    Node := FOther.Children[i];
+    if IsDriveRoot(Node.Path) or FScans.Borrows(Node.Path) then
+      Continue;
+    Drive := FindRoot(IncludeTrailingPathDelimiter(ExtractFileDrive(Node.Path)));
+    if (Drive <> nil) and not IsProvisional(Drive) and not FScans.Borrows(Drive.Path) and
+      (FindPath(Drive, Node.Path) <> nil) then
+    begin
+      DropRoot(Node);
+      RefreshView;
     end;
   end;
-  FWorker := TScanThread.Create(Paths, IDs, Volumes, FRoot);
-  // Do not overlap a new allocation pass with cancellation/cleanup of the old
-  // pass. The timer starts this suspended worker when retired readers are gone.
-  ReapWorkers;
-  if FRetiredWorkers.Count = 0 then
-    FWorker.Start;
+end;
+
+function TFormMain.LaneFor(const RootPath: string): string;
+var
+  Drive: string;
+  Device: Integer;
+  Solid: Boolean;
+begin
+  // Drives on one spinning disk read in turn. An SSD has no seek penalty, so
+  // each scan on it gets its own lane, unless the user grouped the drive by
+  // hand. Locations whose disk is unknown (network shares, SUBST drives) get a
+  // lane per drive.
+  Drive := IncludeTrailingPathDelimiter(ExtractFileDrive(RootPath));
+  if not FIni.ValueExists('PhysicalDevice', Drive) and FSolidState.TryGetValue(Drive, Solid) and Solid then
+    Result := 'root:' + RootKey(RootPath)
+  else if FDevices.TryGetValue(Drive, Device) and (Device >= 0) then
+    Result := 'device:' + Device.ToString
+  else
+    Result := 'path:' + Drive;
+end;
+
+function TFormMain.EnqueueScan(const RootPath, Path: string): TScanJob;
+var
+  Root: TDiskNode;
+begin
+  // A preview is incomplete, so only its whole root can be scanned again.
+  Root := FindRoot(RootPath);
+  if (Root <> nil) and IsProvisional(Root) then
+    Result := FScans.Add(RootPath, RootPath, LaneFor(RootPath))
+  else
+    Result := FScans.Add(RootPath, Path, LaneFor(RootPath));
+  if SamePath(RootPath, Result.Path) and IsDriveRoot(RootPath) then
+    Result.Expected := UsedBytes(IncludeTrailingPathDelimiter(RootPath));
   TimerPoll.Enabled := True;
+  FScans.StartReady(CreateScanWorker);
+end;
+
+function TFormMain.CreateScanWorker(Job: TScanJob): TScanThread;
+var
+  Root: TDiskNode;
+  Volumes: TArray<string>;
+begin
+  // Resolve the root as the job starts, so a queued job holds no node. A
+  // preview is never borrowed: the job scans afresh and replaces it.
+  Root := FindRoot(Job.RootPath);
+  if (Root <> nil) and IsProvisional(Root) then
+    Root := nil;
+  Volumes := nil;
+  if (Root <> nil) and Root.IsVolume and (Root.Capacity > 0) and not SamePath(Job.Path, Root.Path) then
+    Volumes := [Root.Path];
+  Result := TScanThread.Create([Job.Path], Volumes, Root);
+end;
+
+procedure TFormMain.MergeJob(Job: TScanJob; Errors: TStrings);
+var
+  Worker: TScanThread;
+  View: TSavedView;
+  Root, Target, Parent, NewRoot, Replacement: TDiskNode;
+  Index, Skipped: Integer;
+  Space: TVolumeSpace;
+  Current: string;
+  Visited: UInt64;
+begin
+  Worker := Job.Worker;
+  Worker.WaitFor;
+  if Worker.Error <> '' then
+    Errors.Add(Worker.Error);
+  if SamePath(Job.Path, Job.RootPath) then
+  begin
+    Worker.Progress(Current, Visited, Skipped);
+    FSkippedByRoot.AddOrSetValue(RootKey(Job.RootPath), Skipped);
+  end;
+  View := SaveView;
+  ResetViewCaches;
+  Root := FindRoot(Job.RootPath);
+  Target := nil;
+  if Root <> nil then
+    Target := FindPath(Root, Job.Path);
+  Parent := nil;
+  Index := -1;
+  if Target <> nil then
+  begin
+    Parent := Target.Parent;
+    Index := Parent.Children.IndexOf(Target);
+  end;
+  // TakeRoot commits the journal and may detach a reused target from its old
+  // parent. Capture the insertion position before that happens.
+  NewRoot := Worker.TakeRoot;
+  try
+    if (NewRoot <> nil) and (NewRoot.Children.Count = 1) then
+    begin
+      Replacement := NewRoot.Children.Extract(NewRoot.Children[0]);
+      if Parent <> nil then
+      begin
+        Replacement.Parent := Parent;
+        if Replacement = Target then
+          Parent.Children.Insert(Index, Replacement)
+        else
+          Parent.Children[Index] := Replacement;
+      end
+      else if SamePath(Job.Path, Job.RootPath) then
+      begin
+        Parent := ContainerFor(Job.RootPath);
+        InsertRoot(Parent, Replacement);
+      end
+      else
+        // A subtree whose root vanished while queued has nowhere to go.
+        Replacement.Free;
+      while Parent <> nil do
+      begin
+        Parent.Recalculate;
+        Parent := Parent.Parent;
+      end;
+    end;
+  finally
+    NewRoot.Free;
+  end;
+  for Space in Worker.VolumeSpaces do
+  begin
+    Target := FindRoot(Space.Path);
+    if Target <> nil then
+    begin
+      Target.ApplyVolumeSpace(Space.Capacity, Space.FreeSpace);
+      Parent := Target.Parent;
+      while Parent <> nil do
+      begin
+        Parent.Recalculate;
+        Parent := Parent.Parent
+      end;
+    end;
+  end;
+  RestoreView(View);
+  // The result replaced any preview of this root.
+  FProvisional.Remove(RootKey(Job.RootPath));
+  ResolvePending(Job.RootPath, True);
+end;
+
+function TFormMain.IsProvisional(Root: TDiskNode): Boolean;
+begin
+  Result := FProvisional.ContainsKey(RootKey(Root.Path));
+end;
+
+procedure TFormMain.ResolvePending(const RootPath: string; Final: Boolean);
+var
+  Pending: TDiskNode;
+begin
+  // A location opened while it was scanning now has something to show. A
+  // preview may not reach it yet; the final result settles it either way.
+  if (FPendingRoot = '') or not SamePath(FPendingRoot, RootPath) then
+    Exit;
+  Pending := FindScanned(FPendingPath);
+  if ((Pending = nil) or not Pending.IsFolder) and not Final then
+    Exit;
+  FPendingRoot := '';
+  FPendingPath := '';
+  if (Pending <> nil) and Pending.IsFolder then
+  begin
+    FFocus := Pending;
+    FVolumeOverview := FFocus.IsVolume and FPendingOverview and (FFocus.Capacity > 0);
+    FSelected := nil;
+  end;
+end;
+
+procedure TFormMain.RequestPreviews;
+const
+  Interval = 100;
+var
+  Job: TScanJob;
+  Now: UInt64;
+  Delay: Int64;
+  Focus: string;
+begin
+  if not MenuItemLiveScan.IsChecked then
+    Exit;
+  Now := TThread.GetTickCount64;
+  for Job in ViewJobs do
+    if (Job.Worker <> nil) and (Job.Worker.SourceRoot = nil) and not Job.Worker.Done then
+    begin
+      // Every tenth of a second, unless the last preview took more than a
+      // third of that to build and show: a big tree then refreshes less
+      // often, so previews never take over the scan or the UI.
+      Delay := Max(Int64(Interval), 3 * Job.PreviewCost);
+      // Timer ticks and the tick count are both coarse: allow half an
+      // interval, or a 100 ms delay would often wait for a second tick.
+      if (Job.PreviewTick = 0) or (Int64(Now - Job.PreviewTick) + Interval div 2 >= Delay) then
+      begin
+        // The preview covers what this view shows of the scan: the location
+        // being opened, or the focused folder inside it, else its root.
+        Focus := '';
+        if FPendingRoot <> '' then
+          Focus := FPendingPath
+        else if (FFocus <> nil) and PathWithin(FFocus.Path, Job.RootPath) then
+          Focus := FFocus.Path;
+        Job.Worker.RequestPreview(Focus);
+        Job.PreviewTick := Now;
+      end;
+    end;
+end;
+
+procedure TFormMain.InstallPreview(Job: TScanJob; Preview: TDiskNode);
+var
+  View: TSavedView;
+  Old, Container: TDiskNode;
+begin
+  Old := FindRoot(Job.RootPath);
+  if (Old <> nil) and not IsProvisional(Old) then
+  begin
+    // Complete results never give way to a preview.
+    Preview.Free;
+    Exit;
+  end;
+  View := SaveView;
+  ResetViewCaches;
+  if Old <> nil then
+  begin
+    Container := Old.Parent;
+    Container.Children.Remove(Old);
+    Container.Recalculate;
+  end;
+  Container := ContainerFor(Job.RootPath);
+  try
+    InsertRoot(Container, Preview);
+  except
+    Preview.Free;
+    raise
+  end;
+  Container.Recalculate;
+  FProvisional.AddOrSetValue(RootKey(Job.RootPath), True);
+  RestoreView(View);
+  ResolvePending(Job.RootPath, False);
+end;
+
+function TFormMain.SaveView: TSavedView;
+begin
+  Result.HasFocus := FFocus <> nil;
+  Result.Focus := '';
+  if FFocus <> nil then
+    Result.Focus := FFocus.Path;
+  Result.Selected := PathOfNode(FSelected);
+  Result.Context := PathOfNode(FContext);
+end;
+
+function TFormMain.FindNearest(const Path: string): TDiskNode;
+var
+  P: string;
+begin
+  // A folder that disappeared, or is not in a preview, falls back to its
+  // nearest scanned ancestor.
+  P := Path;
+  Result := FindScanned(P);
+  while (Result = nil) and (ExtractFileDir(P) <> P) do
+  begin
+    P := ExtractFileDir(P);
+    Result := FindScanned(P);
+  end;
+  if (Result = nil) or not Result.IsFolder then
+    Result := FRoot;
+end;
+
+procedure TFormMain.RestoreView(const View: TSavedView);
+begin
+  FFocus := nil;
+  if View.HasFocus then
+    FFocus := FindNearest(View.Focus);
+  FVolumeOverview := FVolumeOverview and (FFocus <> nil) and FFocus.IsVolume and (FFocus.Capacity > 0);
+  FSelected := nil;
+  if View.Selected <> '' then
+    FSelected := FindScanned(View.Selected);
+  FContext := nil;
+  if View.Context <> '' then
+    FContext := FindScanned(View.Context);
+end;
+
+procedure TFormMain.ResetViewCaches;
+begin
+  // Release every borrower before the tree changes (see TDiskViewModel).
+  FChartView.Reset;
+  FHover := nil;
+  FHoverKind := chkNone;
+  FViewNodes := nil;
+  ClearFolderRows;
+  if (FSelected is TSmallFileGroup) or (FSelected is TUnscannedSpace) then
+    FSelected := nil;
+  FViewData.Clear;
+end;
+
+procedure TFormMain.RefreshView;
+begin
+  ShowNode(nil);
   UpdateButtons;
-  UpdateScanStatus;
   PaintBoxChart.Repaint;
 end;
 
-procedure TFormMain.ScanSummary;
+function TFormMain.ViewJobs: TArray<TScanJob>;
 var
-  Paths: TList<string>;
+  Job: TScanJob;
+  Root: TDiskNode;
+begin
+  Result := nil;
+  if FPendingRoot <> '' then
+  begin
+    Job := FScans.Find(FPendingRoot);
+    if Job <> nil then
+      Result := [Job];
+  end
+  else if FFocus = FRoot then
+  begin
+    // The summary waits for every included drive.
+    for Job in FScans.Jobs do
+      if ContainerFor(Job.RootPath) = FRoot then
+        Result := Result + [Job];
+  end
+  else
+  begin
+    Root := RootOf(FFocus);
+    if Root <> nil then
+    begin
+      Job := FScans.Find(Root.Path);
+      if Job <> nil then
+        Result := [Job];
+    end;
+  end;
+end;
+
+function TFormMain.ViewBusy: Boolean;
+begin
+  Result := Length(ViewJobs) > 0;
+end;
+
+function TFormMain.ViewBlank: Boolean;
+begin
+  // While scanning, the view shows what is known so far (a preview, or the
+  // results being refreshed) unless the user turned that off or nothing has
+  // arrived yet.
+  Result := ViewBusy and (not MenuItemLiveScan.IsChecked or (FPendingRoot <> '') or (FFocus = nil) or
+    (FFocus.Children = nil) or (FFocus.Children.Count = 0));
+end;
+
+function TFormMain.ViewScanStatus: TScanStatus;
+var
+  Job, Holder: TScanJob;
+  Node: TDiskNode;
+  Current: string;
+  Visited, Processed, Expected, Done, Total: UInt64;
+  Skipped: Integer;
+begin
+  Result := Default(TScanStatus);
+  Done := 0;
+  Total := 0;
+  // The summary's bar also counts the drives that have already finished.
+  if (FPendingRoot = '') and (FFocus = FRoot) then
+    for Node in FRoot.Children do
+      if FScans.Find(Node.Path) = nil then
+      begin
+        Expected := Node.Size;
+        if Node.Capacity > 0 then
+          Expected := Node.Capacity - Node.FreeSpace;
+        Inc(Done, Expected);
+        Inc(Total, Expected);
+        Inc(Result.Visited, Node.Files);
+      end;
+  for Job in ViewJobs do
+    if Job.Worker <> nil then
+    begin
+      Job.Worker.Progress(Current, Visited, Skipped);
+      Job.Worker.ProgressBytes(Processed, Expected);
+      if Expected = 0 then
+        Expected := Job.Expected;
+      if Processed > Expected then
+        Processed := Expected;
+      Inc(Done, Processed);
+      Inc(Total, Expected);
+      Inc(Result.Visited, Visited);
+      if Current = '' then
+        Current := Job.Path;
+      if Result.Current = '' then
+        Result.Current := Current;
+    end
+    else
+    begin
+      Inc(Total, Job.Expected);
+      Holder := FScans.LaneHolder(Job.Lane);
+      if (Result.Waiting = '') and (Holder <> nil) then
+        Result.Waiting := Holder.Path;
+    end;
+  if Total > 0 then
+    Result.Position := Min(127, Integer(Trunc(128 * (Done / Total))));
+end;
+
+function TFormMain.ViewSkipped: Integer;
+var
+  Root: TDiskNode;
+  Count: Integer;
+begin
+  Result := 0;
+  if FFocus = FRoot then
+  begin
+    for Root in FRoot.Children do
+      if FSkippedByRoot.TryGetValue(RootKey(Root.Path), Count) then
+        Inc(Result, Count);
+  end
+  else
+  begin
+    Root := RootOf(FFocus);
+    if (Root <> nil) and FSkippedByRoot.TryGetValue(RootKey(Root.Path), Count) then
+      Result := Count;
+  end;
+end;
+
+procedure TFormMain.StopViewScans;
+var
+  Job: TScanJob;
+begin
+  // Only the scans behind this view stop; other locations keep scanning.
+  for Job in ViewJobs do
+    FScans.Cancel(Job);
+  FPendingRoot := '';
+  FPendingPath := '';
+  TimerPoll.Enabled := True;
+  RefreshView;
+end;
+
+procedure TFormMain.SetPending(const Path, RootPath: string; Overview: Boolean);
+var
+  View: TViewPath;
+begin
+  if (FPendingRoot = '') and (FFocus <> nil) then
+  begin
+    View.Path := FFocus.Path;
+    View.Overview := FVolumeOverview;
+    FHistory.Add(View);
+  end;
+  FPendingPath := Path;
+  FPendingRoot := RootPath;
+  VertScrollBoxFolders.ViewportPosition := PointF(0, 0);
+  FPendingOverview := Overview;
+  FSelected := nil;
+  FHover := nil;
+  FHoverKind := chkNone;
+  RefreshView;
+end;
+
+procedure TFormMain.OpenLocation(const Path: string);
+var
+  Node: TDiskNode;
+  Job: TScanJob;
+  Overview: Boolean;
+begin
+  Overview := IsDriveRoot(Path);
+  Node := FindScanned(Path);
+  if (Node <> nil) and Node.IsFolder then
+  begin
+    // Cached results show at once; during a rescan the view shows its
+    // progress and falls back to these results if it is stopped.
+    FocusNode(Node, True, Overview);
+    Exit;
+  end;
+  for Job in FScans.Jobs do
+    if PathWithin(Path, Job.RootPath) then
+    begin
+      SetPending(Path, Job.RootPath, Overview);
+      Exit;
+    end;
+  Job := EnqueueScan(Path, Path);
+  SetPending(Path, Job.RootPath, Overview);
+end;
+
+procedure TFormMain.ShowSummary;
+begin
+  ScanDrives(False);
+  FocusNode(FRoot);
+end;
+
+procedure TFormMain.ScanDrives(Refresh: Boolean);
+var
   P: string;
 begin
-  Paths := TList<string>.Create;
-  try
-    for P in FDrives do
-      if FIncluded[P] then
-        Paths.Add(P);
-    StartScan(Paths.ToArray);
-    FIncomingSummary := True;
-    UpdateButtons;
-  finally
-    Paths.Free
-  end;
+  // Queue included drives without results, or every idle one on refresh.
+  for P in FDrives do
+    if FIncluded[P] and (FScans.Find(P) = nil) and (Refresh or (FindRoot(P) = nil)) then
+      EnqueueScan(P, P);
+end;
+
+procedure TFormMain.RescanRecycleBins;
+var
+  Container, Root, Bin: TDiskNode;
+begin
+  // Emptying the bin changes only each drive's $Recycle.Bin and free space.
+  for Container in TArray<TDiskNode>.Create(FRoot, FOther) do
+    for Root in Container.Children do
+      if Root.IsVolume and (FScans.Find(Root.Path) = nil) then
+      begin
+        Bin := FindPath(Root, IncludeTrailingPathDelimiter(Root.Path) + '$Recycle.Bin');
+        if Bin <> nil then
+          EnqueueScan(Root.Path, Bin.Path);
+      end;
+  RefreshView;
 end;
 
 function TFormMain.FindPath(Node: TDiskNode; const Path: string): TDiskNode;
@@ -474,151 +1217,67 @@ end;
 
 procedure TFormMain.TimerPollTimer(Sender: TObject);
 var
-  Current: string;
-  Visited, Total: UInt64;
-  Counting: Boolean;
-  Spaces: TArray<TVolumeSpace>;
-  Space: TVolumeSpace;
-  NewRoot, Target, Parent, Replacement, C: TDiskNode;
-  ErrorText: string;
-  Index: Integer;
-  SavedHistory: TList<TViewPath>;
-  SavedView: TViewPath;
-  View: TViewState;
+  Job: TScanJob;
+  Errors: TStringList;
+  Error: string;
+  Changed: Boolean;
+  Preview: TDiskNode;
+  BuildTime: Int64;
+  Shown: TArray<TScanJob>;
+  Clock: TStopwatch;
 begin
-  ReapWorkers;
-  if FWorker = nil then
-    Exit;
-  if not FWorker.StartRequested then
-  begin
-    if FRetiredWorkers.Count = 0 then
-      FWorker.Start;
-    Exit;
-  end;
-  if not FWorker.Done then
-  begin
-    FWorker.Progress(Current, Visited, FSkipped, Total, Counting);
-    ProgressBarScan.Value := FWorker.ProgressPosition;
-    UpdateScanStatus;
-    Exit;
-  end;
-  if FRetiredWorkers.Count <> 0 then
-    Exit;
-  FWorker.WaitFor;
-  ErrorText := FWorker.Error;
-  Spaces := FWorker.VolumeSpaces;
-  SavedHistory := TList<TViewPath>.Create;
+  Errors := TStringList.Create;
   try
-    for View in FHistory do
+    FScans.Reap;
+    Changed := False;
+    repeat
+      Job := FScans.TakeFinished;
+      if Job <> nil then
+      try
+        MergeJob(Job, Errors);
+        Changed := True;
+      finally
+        Job.Free;
+      end;
+    until Job = nil;
+    if (FPendingRoot <> '') and (FScans.Find(FPendingRoot) = nil) then
     begin
-      SavedView.Path := View.Node.Path;
-      SavedView.Overview := View.Overview;
-      SavedHistory.Add(SavedView)
+      FPendingRoot := '';
+      FPendingPath := '';
+      Changed := True;
     end;
-    FHistory.Clear;
-    FChartView.Reset;
-    FFocus := nil;
-    FHover := nil;
-    FHoverKind := chkNone;
-    FContext := nil;
-    FSelected := nil;
-    FViewNodes := nil;
-    ClearFolderRows;
-    FViewData.Clear;
-    Target := nil;
-    if FReplacePath <> '' then
-      Target := FindPath(FRoot, FReplacePath);
-    Parent := nil;
-    Index := -1;
-    if Target <> nil then
-      Parent := Target.Parent;
-    if Parent <> nil then
-      Index := Parent.Children.IndexOf(Target);
-    // TakeRoot commits the journal and may detach a reused target from its old
-    // parent. Capture UI paths and the insertion position before that happens.
-    NewRoot := FWorker.TakeRoot;
-    FreeAndNil(FWorker);
-    if NewRoot = nil then
-    begin
-      // Failed rescans leave the previous complete result intact.
-      FPendingPath := FViewPath;
-      FPendingOverview := FViewOverview;
-      for SavedView in SavedHistory do
+    Shown := nil;
+    Clock := TStopwatch.StartNew;
+    for Job in FScans.Jobs do
+      if Job.Worker <> nil then
       begin
-        C := FindPath(FRoot, SavedView.Path);
-        if C <> nil then
+        Preview := Job.Worker.TakePreview(BuildTime);
+        if Preview <> nil then
         begin
-          View.Node := C;
-          View.Overview := SavedView.Overview;
-          FHistory.Add(View)
+          InstallPreview(Job, Preview);
+          Job.PreviewCost := BuildTime;
+          Shown := Shown + [Job];
+          Changed := True;
         end;
       end;
-    end
-    else if (Parent <> nil) and (NewRoot.Children.Count = 1) then
-    begin
-      Replacement := NewRoot.Children.Extract(NewRoot.Children[0]);
-      Replacement.Parent := Parent;
-      if Replacement = Target then
-        Parent.Children.Insert(Index, Replacement)
-      else
-        Parent.Children[Index] := Replacement;
-      while Parent <> nil do
-      begin
-        Parent.Recalculate;
-        Parent := Parent.Parent;
-      end;
-      NewRoot.Free;
-      FPendingPath := FViewPath;
-      FPendingOverview := FViewOverview;
-      for SavedView in SavedHistory do
-      begin
-        C := FindPath(FRoot, SavedView.Path);
-        if C <> nil then
-        begin
-          View.Node := C;
-          View.Overview := SavedView.Overview;
-          FHistory.Add(View)
-        end;
-      end;
-    end
+    ArrangeRoots;
+    FScans.StartReady(CreateScanWorker);
+    if FScans.Idle then
+      TimerPoll.Enabled := False;
+    if Changed then
+      RefreshView
     else
-    begin
-      FRoot.Free;
-      FRoot := NewRoot;
-      FRootIsSummary := FIncomingSummary
-    end;
+      UpdateScanStatus;
+    // Showing a preview is part of its cost, so measure through the redraw.
+    for Job in Shown do
+      Inc(Job.PreviewCost, Clock.ElapsedMilliseconds);
+    RequestPreviews;
+    // Shown last: the modal loop lets this timer run again meanwhile.
+    for Error in Errors do
+      ShowScannerDialog(Self, Translate('Scan error'), Error, sdkError);
   finally
-    SavedHistory.Free
+    Errors.Free;
   end;
-  for Space in Spaces do
-  begin
-    Target := FindPath(FRoot, Space.Path);
-    if Target <> nil then
-    begin
-      Target.ApplyVolumeSpace(Space.Capacity, Space.FreeSpace);
-      Parent := Target.Parent;
-      while Parent <> nil do
-      begin
-        Parent.Recalculate;
-        Parent := Parent.Parent
-      end;
-    end;
-  end;
-  ProgressBarScan.Value := ProgressBarScan.Max;
-  LayoutScanStatus.Visible := False;
-  if FPendingPath <> '' then
-    FFocus := FindPath(FRoot, FPendingPath);
-  if FFocus = nil then
-    if not FRootIsSummary and (FRoot <> nil) and (FRoot.Children.Count = 1) then
-      FFocus := FRoot.Children[0]
-    else
-      FFocus := FRoot;
-  FVolumeOverview := (FFocus <> nil) and FFocus.IsVolume and FPendingOverview;
-  ShowNode(nil);
-  UpdateButtons;
-  PaintBoxChart.Repaint;
-  if ErrorText <> '' then
-    ShowScannerDialog(Self, Translate('Scan error'), ErrorText, sdkError);
 end;
 
 procedure TFormMain.ShowNode(Node: TDiskNode);
@@ -627,6 +1286,9 @@ begin
     Node := FSelected;
   if Node = nil then
     Node := FFocus;
+  // A location still waiting for its first results has no details yet.
+  if FPendingRoot <> '' then
+    Node := nil;
   UpdateSelection(Node);
 end;
 
@@ -648,13 +1310,11 @@ end;
 
 procedure TFormMain.FocusNode(Node: TDiskNode; Remember, Overview: Boolean);
 var
-  View: TViewState;
+  View: TViewPath;
 begin
-  if (Node = FRoot) and not FRootIsSummary and (FRoot <> nil) and (FRoot.Children.Count = 1) then
-    Node := FRoot.Children[0];
   if (Node <> nil) and Node.IsUsed then
   begin
-    if (FFocus = FRoot) and FRootIsSummary then
+    if FFocus = FRoot then
       Exit;
     Node := Node.Parent;
     Overview := not RootNeedsZoom(Node);
@@ -662,13 +1322,20 @@ begin
   if (Node = nil) or not Node.IsFolder then
     Exit;
   Overview := Overview and Node.IsVolume and (Node.Capacity > 0);
-  if Remember and (FFocus <> nil) and ((FFocus <> Node) or (FVolumeOverview <> Overview)) then
+  // SetPending already remembered the view that was left.
+  if Remember and (FPendingRoot = '') and (FFocus <> nil) and
+    ((FFocus <> Node) or (FVolumeOverview <> Overview)) then
   begin
-    View.Node := FFocus;
+    View.Path := FFocus.Path;
     View.Overview := FVolumeOverview;
     FHistory.Add(View)
   end;
-  CancelScan;
+  // Navigation never cancels scans; they continue in the background.
+  FPendingRoot := '';
+  FPendingPath := '';
+  // A newly opened folder's list starts at the top; refreshes keep the offset.
+  if Node <> FFocus then
+    VertScrollBoxFolders.ViewportPosition := PointF(0, 0);
   FFocus := Node;
   FSelected := nil;
   FVolumeOverview := Overview;
@@ -682,21 +1349,27 @@ end;
 
 procedure TFormMain.UpdateScanStatus;
 var
-  Current: string;
-  Visited, Total: UInt64;
-  Skipped: Integer;
-  Counting: Boolean;
+  Status: TScanStatus;
 begin
-  LayoutScanStatus.Visible := FWorker <> nil;
-  if FWorker = nil then
+  LayoutScanStatus.Visible := ViewBusy;
+  if not LayoutScanStatus.Visible then
     Exit;
-  FWorker.Progress(Current, Visited, Skipped, Total, Counting);
-  LabelScan.Text := Current;
-  if Counting then
-    LabelStatus.Text := Translate('Counting files…')
-  else
+  Status := ViewScanStatus;
+  ProgressBarScan.Value := Status.Position;
+  if Status.Current <> '' then
+  begin
+    LabelScan.Text := Status.Current;
     LabelStatus.Text := Translate('Scanning…  Esc — stop');
-  LabelFilesSummary.Text := FileCountText(Visited);
+  end
+  else
+  begin
+    // Nothing behind this view is reading yet: its device is busy elsewhere.
+    LabelScan.Text := Translate('Queued…');
+    if Status.Waiting <> '' then
+      LabelScan.Text := Format(Translate('Queued after %s'), [Status.Waiting]);
+    LabelStatus.Text := Translate('Queued…  Esc — stop');
+  end;
+  LabelFilesSummary.Text := FileCountText(Status.Visited);
 end;
 
 procedure TFormMain.UpdateButtons;
@@ -705,9 +1378,9 @@ var
   Item: TFmxObject;
 begin
   SpeedButtonBack.Enabled := (FHistory <> nil) and (FHistory.Count > 0);
-  SpeedButtonUp.Enabled := (FFocus <> nil) and (FFocus.ParentFolder <> nil);
+  SpeedButtonUp.Enabled := (FPendingRoot = '') and (FFocus <> nil) and (FFocus.ParentFolder <> nil);
   ActivePath := '';
-  if FWorker <> nil then
+  if FPendingRoot <> '' then
     ActivePath := FPendingPath
   else if FFocus <> nil then
     ActivePath := FFocus.Path;
@@ -719,7 +1392,7 @@ begin
       TFrameDriveButton(Item).SpeedButtonDrive.IsPressed := (Drive <> '') and
         SameText(TFrameDriveButton(Item).SpeedButtonDrive.TagString, Drive);
   SpeedButtonSummary.IsPressed := ActivePath = '';
-  if FWorker <> nil then
+  if ViewBusy then
   begin
     SpeedButtonScan.Hint := Translate('Stop scanning (Esc)');
     PathScanIcon.Data.Assign(PathStopIconTemplate.Data);
@@ -769,25 +1442,39 @@ begin
 end;
 
 procedure TFormMain.SpeedButtonDriveClick(Sender: TObject);
-var
-  P: string;
 begin
-  P := TControl(Sender).TagString;
-  // Original drive buttons start a fresh scan even when the summary is cached.
-  StartScan([P], P);
+  // Cached results show at once; Scan (F5) refreshes them on request.
+  OpenLocation(TControl(Sender).TagString);
 end;
 
 procedure TFormMain.SpeedButtonDriveMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
 var
-  i: Integer;
+  i, Detected: Integer;
+  Automatic: Boolean;
+  Item: TMenuItem;
   Point: TPointF;
 begin
   if Button <> TMouseButton.mbRight then
     Exit;
   FDriveContext := TControl(Sender).TagString;
   MenuItemInclude.IsChecked := FIncluded[FDriveContext];
+  Automatic := not FIni.ValueExists('PhysicalDevice', FDriveContext);
+  Detected := VolumeDisk(FDriveContext);
   for i := 0 to MenuItemPhysical.ItemsCount - 1 do
-    MenuItemPhysical.Items[i].IsChecked := MenuItemPhysical.Items[i].Tag = FDevices[FDriveContext];
+  begin
+    Item := MenuItemPhysical.Items[i];
+    if Item.Tag < 0 then
+    begin
+      Item.Text := Translate('Automatic');
+      if FSolidState[FDriveContext] then
+        Item.Text := Format('%s (%d, SSD)', [Item.Text, Detected])
+      else if Detected >= 0 then
+        Item.Text := Format('%s (%d)', [Item.Text, Detected]);
+      Item.IsChecked := Automatic;
+    end
+    else
+      Item.IsChecked := not Automatic and (Item.Tag = FDevices[FDriveContext]);
+  end;
   Point := TControl(Sender).LocalToScreen(PointF(X, Y));
   PopupMenuDrive.Popup(Point.X, Point.Y);
 end;
@@ -799,16 +1486,34 @@ begin
   FIncluded[FDriveContext] := not FIncluded[FDriveContext];
   FIni.WriteBool('Summary', FDriveContext, FIncluded[FDriveContext]);
   FIni.UpdateFile;
-  ScanSummary;
+  // Results are kept; the drive only moves in or out of the summary.
+  ScanDrives(False);
+  ArrangeRoots;
+  RefreshView;
 end;
 
 procedure TFormMain.MenuItemPhysicalClick(Sender: TObject);
 begin
   if FDriveContext = '' then
     Exit;
-  FDevices[FDriveContext] := TMenuItem(Sender).Tag;
-  FIni.WriteInteger('PhysicalDevice', FDriveContext, TMenuItem(Sender).Tag);
+  if TMenuItem(Sender).Tag < 0 then
+  begin
+    FIni.DeleteKey('PhysicalDevice', FDriveContext);
+    FDevices[FDriveContext] := VolumeDisk(FDriveContext);
+  end
+  else
+  begin
+    FDevices[FDriveContext] := TMenuItem(Sender).Tag;
+    FIni.WriteInteger('PhysicalDevice', FDriveContext, TMenuItem(Sender).Tag);
+  end;
   FIni.UpdateFile;
+  // A queued scan of this drive joins its new device's queue; a running one
+  // keeps its device until it finishes.
+  for var Job in FScans.Jobs do
+    if (Job.Worker = nil) and SameText(IncludeTrailingPathDelimiter(ExtractFileDrive(Job.RootPath)), FDriveContext) then
+      Job.Lane := LaneFor(Job.RootPath);
+  FScans.StartReady(CreateScanWorker);
+  UpdateScanStatus;
 end;
 
 procedure TFormMain.PaintBoxChartPaint(Sender: TObject; Canvas: TCanvas);
@@ -849,7 +1554,7 @@ procedure TFormMain.PaintBoxChartMouseLeave(Sender: TObject);
 begin
   FHover := nil;
   FHoverKind := chkNone;
-  if FWorker = nil then
+  if not ViewBlank then
     ShowNode(nil);
   PaintBoxChart.Repaint
 end;
@@ -860,7 +1565,7 @@ var
   Hit: TChartHit;
   Item: TFmxObject;
 begin
-  if (FWorker <> nil) or (FFocus = nil) then
+  if ViewBlank or (FFocus = nil) then
     Exit;
   Hit := FChartView.HitTest(PaintBoxChart.LocalRect, ChartContext, X, Y);
   if (Button = TMouseButton.mbLeft) and (Hit.Kind = chkParent) then
@@ -869,7 +1574,7 @@ begin
     Exit;
   end;
   N := Hit.Node;
-  if (N = nil) or (FWorker <> nil) then
+  if N = nil then
     Exit;
   if Button = TMouseButton.mbLeft then
   begin
@@ -894,16 +1599,23 @@ begin
 end;
 
 procedure TFormMain.Rescan(Node: TDiskNode);
+var
+  Root: TDiskNode;
 begin
-  if Node = nil then
+  if (Node = nil) or (Node.Path = '') then
   begin
-    ScanSummary;
+    ScanDrives(True);
+    if FFocus = nil then
+      FocusNode(FRoot)
+    else
+      RefreshView;
     Exit
   end;
-  if Node.Path = '' then
-    ScanSummary
-  else
-    StartScan([Node.Path], Node.Path, Node.Path);
+  Root := RootOf(Node);
+  if Root = nil then
+    Exit;
+  EnqueueScan(Root.Path, Node.Path);
+  RefreshView;
 end;
 
 procedure TFormMain.ApplicationException(Sender: TObject; E: Exception);
@@ -913,11 +1625,9 @@ end;
 
 procedure TFormMain.ExecuteUICommand(Sender: TObject);
 var
-  View: TViewState;
+  View: TViewPath;
   Op: Integer;
   Status: HRESULT;
-  SavedFocus: string;
-  SavedOverview: Boolean;
 begin
   Op := TFmxObject(Sender).Tag;
   case Op of
@@ -928,40 +1638,24 @@ begin
       begin
         Status := SHEmptyRecycleBin(FormToHWND(Self), nil, SHERB_NOCONFIRMATION or SHERB_NOPROGRESSUI);
         if Succeeded(Status) then
-        begin
-          if FRootIsSummary then
-          begin
-            SavedFocus := '';
-            if FFocus <> nil then
-              SavedFocus := FFocus.Path;
-            SavedOverview := FVolumeOverview;
-            ScanSummary;
-            FPendingPath := SavedFocus;
-            FPendingOverview := SavedOverview;
-          end
-          else
-            Rescan(FFocus);
-        end
+          RescanRecycleBins
         else if (Status <> HRESULT($800704C7)) and (Status <> E_ABORT) then
           FileActionError(Translate('Empty Recycle Bin'), '', SysErrorMessage(Status and $FFFF) + ' (0x' + IntToHex(Cardinal(Status), 8) + ')');
       end;
     3:
-      if (FFocus <> nil) and (FFocus.ParentFolder <> nil) then
+      if (FPendingRoot = '') and (FFocus <> nil) and (FFocus.ParentFolder <> nil) then
         FocusNode(FFocus.ParentFolder, True, FFocus.ParentFolder.IsVolume and not RootNeedsZoom(FFocus.ParentFolder));
     4:
       if FHistory.Count > 0 then
       begin
         View := FHistory.Last;
         FHistory.Delete(FHistory.Count - 1);
-        FocusNode(View.Node, False, View.Overview)
+        FocusNode(FindNearest(View.Path), False, View.Overview)
       end;
     5:
       Rescan(FFocus);
     8:
-      if FRootIsSummary and (FRoot <> nil) and ((FFocus <> FRoot) or (FWorker <> nil)) then
-        FocusNode(FRoot)
-      else
-        ScanSummary;
+      ShowSummary;
   end;
 end;
 
@@ -994,19 +1688,22 @@ end;
 procedure TFormMain.RemoveNode(Node: TDiskNode; Recycle: Boolean);
 var
   Operation: TSHFileOpStruct;
-  FromPath, Question, ParentPath, Details: string;
+  NodePath, FromPath, Question, ParentPath, Details: string;
   Status: Integer;
+  Root: TDiskNode;
 begin
   if (Node = nil) or (Node.Path = '') or Node.IsVolume then
     Exit;
+  // Background merges may replace nodes while the dialog is open; keep the path.
+  NodePath := Node.Path;
   if Recycle then
     Question := Translate('Move to the Recycle Bin?')
   else
     Question := Translate('Permanently remove?');
-  if ShowScannerDialog(Self, Translate('Confirm action'), Question + sLineBreak + Node.Path, sdkConfirmation) <> mrYes then
+  if ShowScannerDialog(Self, Translate('Confirm action'), Question + sLineBreak + NodePath, sdkConfirmation) <> mrYes then
     Exit;
-  ParentPath := ExtractFileDir(Node.Path);
-  FromPath := Node.Path + #0 + #0;
+  ParentPath := ExtractFileDir(NodePath);
+  FromPath := NodePath + #0 + #0;
   FillChar(Operation, SizeOf(Operation), 0);
   Operation.Wnd := FormToHWND(Self);
   Operation.wFunc := FO_DELETE;
@@ -1018,7 +1715,17 @@ begin
   if Operation.fAnyOperationsAborted or (Status = ERROR_CANCELLED) or (Status = $75) then
     Exit;
   if Status = 0 then
-    Rescan(FindPath(FRoot, ParentPath))
+  begin
+    // A removed chosen folder leaves nothing to rescan; drop its results.
+    Root := FindRoot(NodePath);
+    if Root = nil then
+      Rescan(FindScanned(ParentPath))
+    else if not FScans.Borrows(Root.Path) then
+    begin
+      DropRoot(Root);
+      RefreshView;
+    end;
+  end
   else
   begin
     case Status of
@@ -1033,7 +1740,7 @@ begin
     else
       Details := SysErrorMessage(Status);
     end;
-    FileActionError(Question, Node.Path, Details + ' (' + IntToStr(Status) + ')');
+    FileActionError(Question, NodePath, Details + ' (' + IntToStr(Status) + ')');
   end;
 end;
 
@@ -1072,29 +1779,33 @@ begin
   if SelectDirectory(Translate('Select folder'), '', Folder) then
   begin
     FStartFolder := Folder;
-    StartScan([Folder], Folder)
+    OpenLocation(Folder)
   end;
 end;
 
 procedure TFormMain.SaveLog;
 var
   Log: TStringList;
-  P, Current: string;
+  Current: string;
   Count: UInt64;
   Skipped: Integer;
+  Job: TScanJob;
+  Container, Root: TDiskNode;
 begin
   Log := TStringList.Create;
   try
     Log.Add('Scanner FMX - ' + DateTimeToStr(Now));
-    if FWorker <> nil then
-    begin
-      FWorker.Progress(Current, Count, Skipped);
-      Log.Add(Current);
-      Log.Add(Format(Translate('Files: %s'), [UIntToStr(Count)]));
-      Log.Add(Format(Translate('Skipped: %s'), [Skipped.ToString]))
-    end;
-    for P in FScanPaths do
-      Log.Add(Format(Translate('Scan: %s'), [P]));
+    for Job in ViewJobs do
+      if Job.Worker <> nil then
+      begin
+        Job.Worker.Progress(Current, Count, Skipped);
+        Log.Add(Current);
+        Log.Add(Format(Translate('Files: %s'), [UIntToStr(Count)]));
+        Log.Add(Format(Translate('Skipped: %s'), [Skipped.ToString]))
+      end;
+    for Container in TArray<TDiskNode>.Create(FRoot, FOther) do
+      for Root in Container.Children do
+        Log.Add(Format(Translate('Scan: %s'), [Root.Path]));
     if FFocus <> nil then
     begin
       Log.Add(Format(Translate('Focus: %s'), [FFocus.Path]));
@@ -1117,7 +1828,8 @@ begin
   end
   else if Key = vkF5 then
   begin
-    Rescan(FFocus);
+    if not ViewBusy then
+      Rescan(FFocus);
     Key := 0
   end
   else if (Key = vkBack) or ((ssAlt in Shift) and (Key = vkLeft)) then
@@ -1130,11 +1842,9 @@ begin
     SpeedButtonUpClick(SpeedButtonUp);
     Key := 0
   end
-  else if Key = vkEscape then
+  else if (Key = vkEscape) and ViewBusy then
   begin
-    CancelScan;
-    LayoutScanStatus.Visible := False;
-    ShowNode(nil);
+    StopViewScans;
     LabelStatus.Text := Translate('Scan stopped')
   end
   else if UpCase(KeyChar) = 'L' then
@@ -1276,7 +1986,7 @@ begin
   Result.Nodes := FViewNodes;
   Result.HoverPoint := FHoverPoint;
   Result.HoverKind := FHoverKind;
-  Result.Busy := FWorker <> nil;
+  Result.Busy := ViewBlank;
   Result.Theme := ChartTheme;
 end;
 
@@ -1324,19 +2034,34 @@ var
   Capacity, FreeBytes: UInt64;
   AvailableBytes, TotalBytes, VolumeFreeBytes: Int64;
   VolumePath: string;
+  Skipped: Integer;
 begin
   if FClosing then
     Exit;
-  if FWorker <> nil then
+  if ViewBlank then
   begin
-    LabelEmpty.Visible := True;
-    LabelEmpty.Text := Translate('Scanning…');
+    FViewNodes := nil;
+    BuildFolderRows;
     SpeedButtonOpen.Enabled := False;
     LabelPageSubtitle.Text := Translate('Scanning files and folders');
-    if FPendingPath <> '' then
+    if FPendingRoot <> '' then
     begin
       LabelPath.Text := Translate('This PC') + '  ›  ' + FPendingPath;
       LabelPageTitle.Text := FPendingPath;
+      // Nothing is known about this location yet.
+      LabelUsedValue.Text := '—';
+      LabelFreeValue.Text := '—';
+      LabelTotalValue.Text := '—';
+      LabelUsagePercent.Text := '';
+      RectangleUsageFill.TagFloat := 0;
+      FormMainResize(nil);
+    end
+    else
+    begin
+      LabelPageTitle.Text := NodeTitle(FFocus);
+      LabelPath.Text := Translate('This PC');
+      if (FFocus <> nil) and (FFocus.Path <> '') then
+        LabelPath.Text := LabelPath.Text + '  ›  ' + FFocus.Path;
     end;
     UpdateScanStatus;
     Exit;
@@ -1346,8 +2071,11 @@ begin
   if (FFocus <> nil) and (FFocus.Path <> '') then
     LabelPath.Text := LabelPath.Text + '  ›  ' + FFocus.Path;
   LabelPageSubtitle.Text := Translate('Scan results');
-  if FSkipped > 0 then
-    LabelPageSubtitle.Text := LabelPageSubtitle.Text + ' · ' + Format(Translate('Unavailable: %s'), [IntToStr(FSkipped)]);
+  Skipped := ViewSkipped;
+  if ViewBusy then
+    LabelPageSubtitle.Text := Translate('Scanning files and folders')
+  else if Skipped > 0 then
+    LabelPageSubtitle.Text := LabelPageSubtitle.Text + ' · ' + Format(Translate('Unavailable: %s'), [IntToStr(Skipped)]);
   Capacity := 0;
   FreeBytes := 0;
   N := FFocus;
@@ -1355,7 +2083,8 @@ begin
   begin
     LabelUsedValue.Text := FormatBytes(N.Size);
     LabelFilesSummary.Text := Format(Translate('%s · %s'), [FileCountText(N.Files), FolderCountText(FolderCount(N))]);
-    while (N.Parent <> nil) and not N.IsVolume do
+    // A chosen folder stops at its own root; the drive fallback below applies.
+    while not N.IsVolume and (N.Parent <> nil) and (N.Parent <> FOther) do
       N := N.Parent;
     Capacity := N.Capacity;
     FreeBytes := N.FreeSpace;
@@ -1398,6 +2127,8 @@ begin
   BuildFolderRows;
   ShowNode(nil);
   FormMainResize(nil);
+  // Results shown during a scan keep its progress and status line visible.
+  UpdateScanStatus;
 end;
 
 procedure TFormMain.ReleaseChildCapture(Container: TFmxObject);
@@ -1410,63 +2141,123 @@ end;
 
 procedure TFormMain.ClearFolderRows;
 var
-  Item: TFmxObject;
   Row: TFrameFolderItem;
 begin
-  // FMX calls Click after OnDblClick and then continues MouseDown.
-  // Detach rows now, but destroy them after the current event dispatch.
-  ReleaseChildCapture(VertScrollBoxFolders.Content);
-  while VertScrollBoxFolders.Content.ChildrenCount > 0 do
-  begin
-    Item := VertScrollBoxFolders.Content.Children[0];
-    if Item is TFrameFolderItem then
-    begin
-      Row := TFrameFolderItem(Item);
-      Row.SpeedButtonFolderItem.OnClick := nil;
-      Row.SpeedButtonFolderItem.OnDblClick := nil;
-      Row.SpeedButtonFolderItem.OnMouseDown := nil;
-      Row.SpeedButtonFolderItem.TagObject := nil;
-    end;
-    Item.Release;
-  end;
+  // Rows borrow nodes: unbind them before the tree changes. Rows stay visible
+  // and the spacer keeps its height, because the refresh that follows binds
+  // them again before anything is painted; hiding and showing ~15 rows cost
+  // more than the rest of the refresh.
+  FRowNodes := nil;
+  for Row in FRows do
+    Row.SpeedButtonFolderItem.TagObject := nil;
 end;
 
 procedure TFormMain.BuildFolderRows;
 var
   N: TDiskNode;
-  Row: TFrameFolderItem;
-  Index: Integer;
+  Nodes: TList<TDiskNode>;
 begin
+  Nodes := TList<TDiskNode>.Create;
+  try
+    if (FFocus <> nil) and not ViewBlank and (FFocus.Children <> nil) then
+      for N in FViewNodes do
+        if not N.Hidden then
+          Nodes.Add(N);
+    FRowNodes := Nodes.ToArray;
+  finally
+    Nodes.Free
+  end;
+  LabelEmpty.Visible := Length(FRowNodes) = 0;
+  LabelEmpty.Text := Translate('Folder is empty');
+  if ViewBlank then
+    LabelEmpty.Text := Translate('Scanning…')
+  else if FFocus = nil then
+    LabelEmpty.Text := Translate('Select a drive or folder');
+  BindRows;
+end;
+
+procedure TFormMain.EnsureRows(Count: Integer);
+var
+  Row: TFrameFolderItem;
+begin
+  while FRows.Count < Count do
+  begin
+    Row := TFrameFolderItem.Create(Self);
+    try
+      Row.Name := '';
+      Row.Align := TAlignLayout.None;
+      Row.Anchors := [TAnchorKind.akLeft, TAnchorKind.akTop, TAnchorKind.akRight];
+      Row.Visible := False;
+      Row.Parent := VertScrollBoxFolders;
+      Row.SpeedButtonFolderItem.OnClick := SpeedButtonFolderItemClick;
+      Row.SpeedButtonFolderItem.OnDblClick := SpeedButtonFolderItemDblClick;
+      Row.SpeedButtonFolderItem.OnMouseDown := SpeedButtonFolderItemMouseDown;
+      FRows.Add(Row);
+    except
+      Row.Free;
+      raise
+    end;
+    ApplyThemeTo(Row);
+    if FRowHeight <= 0 then
+      FRowHeight := Row.Height;
+  end;
+end;
+
+procedure TFormMain.BindRows;
+var
+  First, Shown: Integer;
+  i, Index: NativeInt;
+  Row: TFrameFolderItem;
+  Node: TDiskNode;
+  Width: Single;
+begin
+  if FClosing then
+    Exit;
+  EnsureRows(1);
+  // Enough rows to fill the viewport, plus one cut by its edges.
+  Shown := Ceil(VertScrollBoxFolders.Height / FRowHeight) + 1;
+  EnsureRows(Shown);
+  First := Max(0, Integer(Trunc(VertScrollBoxFolders.ViewportPosition.Y / FRowHeight)));
+  Width := VertScrollBoxFolders.Content.Width;
+  if Width <= 0 then
+    Width := VertScrollBoxFolders.Width;
   VertScrollBoxFolders.BeginUpdate;
   try
-    ClearFolderRows;
-    Index := 0;
-    if (FFocus <> nil) and (FWorker = nil) and (FFocus.Children <> nil) then
-      for N in FViewNodes do
+    FRowSpacer.SetBounds(0, 0, 1, Length(FRowNodes) * FRowHeight);
+    for i := 0 to FRows.Count - 1 do
+    begin
+      Row := FRows[i];
+      Index := First + i;
+      if (i < Shown) and (Index < Length(FRowNodes)) then
       begin
-        if N.Hidden then
-          Continue;
-        Row := TFrameFolderItem.Create(Self);
-        Row.Name := '';
-        Row.Parent := VertScrollBoxFolders;
-        Row.Position.Y := Index * 62;
-        Row.BindNode(N, ViewFraction(N), NodeColor(N));
-        Row.SpeedButtonFolderItem.IsPressed := N = FSelected;
-        Row.SpeedButtonFolderItem.OnClick := SpeedButtonFolderItemClick;
-        Row.SpeedButtonFolderItem.OnDblClick := SpeedButtonFolderItemDblClick;
-        Row.SpeedButtonFolderItem.OnMouseDown := SpeedButtonFolderItemMouseDown;
-        Inc(Index);
+        Node := FRowNodes[Index];
+        Row.SetBounds(0, Index * FRowHeight, Width, FRowHeight);
+        Row.BindNode(Node, ViewFraction(Node), NodeColor(Node));
+        Row.SpeedButtonFolderItem.IsPressed := Node = FSelected;
+        Row.Visible := True;
+      end
+      else
+      begin
+        Row.SpeedButtonFolderItem.TagObject := nil;
+        Row.Visible := False;
       end;
-    LabelEmpty.Visible := Index = 0;
-    LabelEmpty.Text := Translate('Folder is empty');
-    if FWorker <> nil then
-      LabelEmpty.Text := Translate('Scanning…')
-    else if FFocus = nil then
-      LabelEmpty.Text := Translate('Select a drive or folder');
-    ApplyThemeTo(VertScrollBoxFolders.Content);
+    end;
   finally
     VertScrollBoxFolders.EndUpdate;
   end;
+end;
+
+procedure TFormMain.FolderRowsViewportChange(Sender: TObject; const OldViewportPosition, NewViewportPosition: TPointF;
+  const ContentSizeChanged: Boolean);
+begin
+  BindRows;
+end;
+
+procedure TFormMain.FolderRowsResize(Sender: TObject);
+begin
+  // A taller list needs more rows, and every row follows the new width.
+  if FDesignReady then
+    BindRows;
 end;
 
 procedure TFormMain.UpdateSelection(Node: TDiskNode);
@@ -1503,8 +2294,17 @@ end;
 procedure TFormMain.SpeedButtonFolderItemClick(Sender: TObject);
 var
   Item: TFmxObject;
+  Pressed: TDiskNode;
 begin
   FSelected := TDiskNode(TFmxObject(Sender).TagObject);
+  // A preview may have re-bound this row since it was pressed.
+  if FPressedPath <> '' then
+  begin
+    Pressed := FindScanned(FPressedPath);
+    if Pressed <> nil then
+      FSelected := Pressed;
+    FPressedPath := '';
+  end;
   for Item in VertScrollBoxFolders.Content.Children do
     if Item is TFrameFolderItem then
       TFrameFolderItem(Item).SpeedButtonFolderItem.IsPressed := TFrameFolderItem(Item).Node = FSelected;
@@ -1517,19 +2317,32 @@ end;
 procedure TFormMain.SpeedButtonFolderItemDblClick(Sender: TObject);
 var
   Node: TDiskNode;
+  Path: string;
 begin
   Node := TDiskNode(TFmxObject(Sender).TagObject);
-  if (Node = nil) or (FWorker <> nil) then
+  if (Node = nil) or ViewBlank then
     Exit;
-  if (Node is TSmallFileGroup) or Node.IsFree or (Node is TUnscannedSpace) then
+  if (Node is TSmallFileGroup) or Node.IsFree or (Node is TUnscannedSpace) or not Node.IsFolder then
     Exit;
-  if Node.IsFolder then
-    FocusNode(Node);
+  Path := FPressedPath;
+  if Path = '' then
+    Path := Node.Path;
+  // FMX still sends this row a Click after OnDblClick, and opening the folder
+  // re-binds the rows; open it once that click has been handled.
+  TThread.ForceQueue(nil,
+    procedure
+    var
+      Target: TDiskNode;
+    begin
+      Target := FindScanned(Path);
+      if (Target <> nil) and Target.IsFolder then
+        FocusNode(Target);
+    end);
 end;
 
 procedure TFormMain.PopupNode(Node: TDiskNode; const ScreenPoint: TPointF);
 begin
-  if (Node = nil) or (Node is TSmallFileGroup) or (Node is TUnscannedSpace) or Node.IsFree or (FWorker <> nil) then
+  if (Node = nil) or (Node is TSmallFileGroup) or (Node is TUnscannedSpace) or Node.IsFree or ViewBlank then
     Exit;
   if Node.IsUsed then
     Node := Node.Parent;
@@ -1552,6 +2365,7 @@ end;
 
 procedure TFormMain.SpeedButtonFolderItemMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Single);
 begin
+  FPressedPath := PathOfNode(TDiskNode(TFmxObject(Sender).TagObject));
   if Button = TMouseButton.mbRight then
   begin
     SpeedButtonFolderItemClick(Sender);
@@ -1576,9 +2390,9 @@ end;
 
 procedure TFormMain.SpeedButtonScanClick(Sender: TObject);
 begin
-  if FWorker <> nil then
+  if ViewBusy then
   begin
-    CancelScan;
+    StopViewScans;
     LabelStatus.Text := Translate('Scan stopped');
   end
   else
@@ -1671,6 +2485,28 @@ begin
   ExecuteSettingsAction(Sender);
 end;
 
+procedure TFormMain.MenuItemFreeSpaceClick(Sender: TObject);
+begin
+  MenuItemFreeSpace.IsChecked := not MenuItemFreeSpace.IsChecked;
+  FIni.WriteBool('Appearance', 'HideFreeSpace', MenuItemFreeSpace.IsChecked);
+  FIni.UpdateFile;
+  ResetViewCaches;
+  if (FSelected <> nil) and FSelected.IsFree then
+    FSelected := nil;
+  FViewData.ShowFreeSpace := not MenuItemFreeSpace.IsChecked;
+  RefreshView;
+end;
+
+procedure TFormMain.MenuItemLiveScanClick(Sender: TObject);
+begin
+  MenuItemLiveScan.IsChecked := not MenuItemLiveScan.IsChecked;
+  FIni.WriteBool('Appearance', 'LiveScan', MenuItemLiveScan.IsChecked);
+  FIni.UpdateFile;
+  // Previews already shown stay until their scans finish; the next timer
+  // tick asks for new ones if this was turned on.
+  RefreshView;
+end;
+
 procedure TFormMain.MenuItemHideClick(Sender: TObject);
 begin
   ExecuteNodeAction(Sender);
@@ -1723,6 +2559,8 @@ begin
   MenuItemApps.Text := Translate('Programs and Features');
   MenuItemTrash.Text := Translate('Empty Recycle Bin…');
   MenuItemAbout.Text := Translate('About Scanner');
+  MenuItemFreeSpace.Text := Translate('Don''t draw free space');
+  MenuItemLiveScan.Text := Translate('Show results while scanning');
   SpeedButtonUp.Hint := Translate('Parent folder (Alt+Up)');
   SpeedButtonBack.Hint := Translate('Back (Alt+Left)');
   MenuItemInclude.Text := Translate('Include in summary');

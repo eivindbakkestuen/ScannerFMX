@@ -28,6 +28,8 @@ type
     FSegments: TList<TChartSegment>;
     FCenter: TPointF;
     FRadius, FCenterRadius: Single;
+    // Sum of the focus's drawn fractions; below 1 when free space is hidden.
+    FFocusTotal: Double;
     FLevels: Integer;
     FPreviousAngles: TArray<Single>;
     FPaintedFocus: TDiskNode;
@@ -166,7 +168,7 @@ begin
   for C in Items do
   begin
     if Node = FContext.Focus then
-      Arc := Sweep * FContext.Data.Fraction(FContext.Focus, C)
+      Arc := Sweep * FContext.Data.Fraction(FContext.Focus, C) / FFocusTotal
     else
       Arc := Sweep * (C.Size / Node.Size);
     if VisibleSegment(C, Arc) then
@@ -197,7 +199,7 @@ begin
   for C in Items do
   begin
     if Depth = 1 then
-      Arc := Sweep * FContext.Data.Fraction(FContext.Focus, C)
+      Arc := Sweep * FContext.Data.Fraction(FContext.Focus, C) / FFocusTotal
     else
       Arc := Sweep * (C.Size / Node.Size);
     Arc := Min(Arc, Max(0, Start + Sweep - Angle));
@@ -235,6 +237,12 @@ begin
   FCenterRadius := FRadius * 0.30;
   if FRadius < 20 then
     Exit;
+  // The ring fills the circle with whatever the view model lists for the focus.
+  FFocusTotal := 0;
+  for var C in FContext.Nodes do
+    FFocusTotal := FFocusTotal + FContext.Data.Fraction(FContext.Focus, C);
+  if FFocusTotal <= 0 then
+    FFocusTotal := 1;
   FLevels := Min(5, Max(2, VisibleDepth(FContext.Focus, 0, 360) + 1));
   SetLength(FPreviousAngles, 20);
   for var i := 0 to High(FPreviousAngles) do

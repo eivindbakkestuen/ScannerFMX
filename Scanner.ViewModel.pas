@@ -25,11 +25,16 @@ type
   TDiskViewModel = class
   private
     FFolderViews: TObjectDictionary<TDiskNode, TFolderView>;
+    FShowFreeSpace: Boolean;
     function FolderView(Node: TDiskNode): TFolderView;
+    procedure SetShowFreeSpace(Value: Boolean);
   public
     constructor Create;
     destructor Destroy; override;
     procedure Clear;
+    // Whether a volume's free space is one of its top-level items. Changing
+    // it clears the cache, so clear its consumers first.
+    property ShowFreeSpace: Boolean read FShowFreeSpace write SetShowFreeSpace;
     function GetChildren(Node: TDiskNode; IncludeVolumeSpace: Boolean = False): TArray<TDiskNode>;
     function Fraction(Focus, Node: TDiskNode): Double;
     function ColorIndex(Focus, Node: TDiskNode): Integer;
@@ -50,6 +55,7 @@ constructor TDiskViewModel.Create;
 begin
   inherited;
   FFolderViews := TObjectDictionary<TDiskNode, TFolderView>.Create([doOwnsValues]);
+  FShowFreeSpace := True;
 end;
 
 destructor TDiskViewModel.Destroy;
@@ -61,6 +67,14 @@ end;
 procedure TDiskViewModel.Clear;
 begin
   FFolderViews.Clear;
+end;
+
+procedure TDiskViewModel.SetShowFreeSpace(Value: Boolean);
+begin
+  if FShowFreeSpace = Value then
+    Exit;
+  FShowFreeSpace := Value;
+  Clear;
 end;
 
 function TDiskViewModel.GetChildren(Node: TDiskNode; IncludeVolumeSpace: Boolean): TArray<TDiskNode>;
@@ -182,7 +196,8 @@ begin
       Result.RootNodes := Copy(Result.Nodes);
       if Result.OtherUsed <> nil then
         Result.RootNodes := Result.RootNodes + [TDiskNode(Result.OtherUsed)];
-      if Node.IsVolume and (Node.Capacity > 0) and (Node.FreeArea <> nil) and (Node.FreeSpace > 0) then
+      if FShowFreeSpace and Node.IsVolume and (Node.Capacity > 0) and (Node.FreeArea <> nil) and
+        (Node.FreeSpace > 0) then
         Result.RootNodes := Result.RootNodes + [Node.FreeArea];
       Result.Colors := TDictionary<TDiskNode, Integer>.Create;
       for var i := 0 to High(Result.RootNodes) do
