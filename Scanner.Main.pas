@@ -72,6 +72,18 @@ type
     SpeedButtonScan: TSpeedButton;
     PathBrowseIcon: TPath;
     SpeedButtonBrowse: TSpeedButton;
+    PathSidebarIcon: TPath;
+    SpeedButtonSidebar: TSpeedButton;
+    PathLocationsIcon: TPath;
+    SpeedButtonLocations: TSpeedButton;
+    PathToolbarThemeIcon: TPath;
+    SpeedButtonToolbarTheme: TSpeedButton;
+    PathToolbarSettingsIcon: TPath;
+    SpeedButtonToolbarSettings: TSpeedButton;
+    PathChartOnlyIcon: TPath;
+    SpeedButtonChartOnly: TSpeedButton;
+    PathFolderPanelIcon: TPath;
+    SpeedButtonFolderPanel: TSpeedButton;
     LabelPath: TLabel;
     RectangleBreadcrumbBorder: TRectangle;
     LayoutToolbar: TLayout;
@@ -136,7 +148,11 @@ type
     MenuItemFreeSpace: TMenuItem;
     MenuItemLiveScan: TMenuItem;
     MenuItemGraphFont: TMenuItem;
+    MenuItemShowLocations: TMenuItem;
+    MenuItemShowFolderPanel: TMenuItem;
+    MenuItemChartOnly: TMenuItem;
     PopupMenuSettings: TPopupMenu;
+    PopupMenuLocations: TPopupMenu;
     PathScanIconTemplate: TPath;
     PathStopIconTemplate: TPath;
     PathFolderIconTemplate: TPath;
@@ -192,6 +208,14 @@ type
     procedure MenuItemFreeSpaceClick(Sender: TObject);
     procedure MenuItemLiveScanClick(Sender: TObject);
     procedure MenuItemGraphFontClick(Sender: TObject);
+    procedure MenuItemShowLocationsClick(Sender: TObject);
+    procedure MenuItemShowFolderPanelClick(Sender: TObject);
+    procedure MenuItemChartOnlyClick(Sender: TObject);
+    procedure SpeedButtonSidebarClick(Sender: TObject);
+    procedure SpeedButtonLocationsClick(Sender: TObject);
+    procedure SpeedButtonToolbarSettingsClick(Sender: TObject);
+    procedure SpeedButtonChartOnlyClick(Sender: TObject);
+    procedure SpeedButtonFolderPanelClick(Sender: TObject);
     procedure MenuItemHideClick(Sender: TObject);
     procedure MenuItemZoomClick(Sender: TObject);
     procedure MenuItemRescanClick(Sender: TObject);
@@ -238,6 +262,9 @@ type
     // The chart's typeface and its size in points.
     FGraphFont: string;
     FGraphFontSize: Integer;
+    // The side panels the user wants; chart-only mode hides them for a while
+    // without changing that choice.
+    FShowLocations, FShowFolderPanel, FChartOnly: Boolean;
     FDesignReady: Boolean;
     FSelected: TDiskNode;
     FViewNodes: TArray<TDiskNode>;
@@ -253,6 +280,13 @@ type
     procedure ExecuteSettingsAction(Sender: TObject);
     procedure SelectLanguage(const Language: string);
     function ChooseGraphFont: Boolean;
+    procedure SetPanels(ShowLocations, ShowFolderPanel, ChartOnly: Boolean);
+    procedure SavePanels;
+    procedure ToggleLocations;
+    procedure ToggleFolderPanel;
+    procedure UpdateMinimumSize;
+    procedure PopupBelow(Menu: TPopupMenu; Control: TControl);
+    procedure MenuItemLocationClick(Sender: TObject);
     function ThemeColor(const Role: string): TAlphaColor;
     function ChartContext: TChartContext;
     function ChartTheme: TChartTheme;
@@ -345,6 +379,11 @@ const
   // leave no room for nested folders.
   MinGraphFontSize = 6;
   MaxGraphFontSize = 16;
+  // The window never gets so small that the chart is smaller than this, or
+  // the location path in the toolbar narrower.
+  MinChartWidth = 340;
+  MinChartHeight = 200;
+  MinPathWidth = 120;
 
 function TFormMain.ViewFraction(Node: TDiskNode): Double;
 begin
@@ -417,7 +456,15 @@ begin
     MenuItemPhysical.AddObject(Item);
   end;
   FDesignReady := True;
+  // The toolbar stands in for the locations panel's buttons while it is hidden.
+  PathLocationsIcon.Data.Assign(PathSummaryIcon.Data);
+  PathToolbarSettingsIcon.Data.Assign(PathSettingsIcon.Data);
+  // Showing or hiding a panel changes the usage bar's width without resizing
+  // the window.
+  RectangleUsageTrack.OnResize := FormMainResize;
   ApplyTheme(FIni.ReadBool('Appearance', 'DarkTheme', True));
+  SetPanels(FIni.ReadBool('Appearance', 'ShowLocationsPanel', True),
+    FIni.ReadBool('Appearance', 'ShowFolderPanel', True), False);
   BuildDriveButtons;
   BuildChartViewButtons;
   ProgressBarScan.Max := 128;
@@ -1857,6 +1904,28 @@ begin
     SpeedButtonUpClick(SpeedButtonUp);
     Key := 0
   end
+  else if (ssCtrl in Shift) and (Key = Ord('B')) then
+  begin
+    ToggleLocations;
+    Key := 0
+  end
+  else if (ssCtrl in Shift) and (Key = Ord('D')) then
+  begin
+    ToggleFolderPanel;
+    Key := 0
+  end
+  else if Key = vkF11 then
+  begin
+    SetPanels(FShowLocations, FShowFolderPanel, not FChartOnly);
+    Key := 0
+  end
+  // Leaving chart-only mode comes first, so Escape never stops a scan the
+  // user did not mean to stop.
+  else if (Key = vkEscape) and FChartOnly then
+  begin
+    SetPanels(FShowLocations, FShowFolderPanel, False);
+    Key := 0
+  end
   else if (Key = vkEscape) and ViewBusy then
   begin
     StopViewScans;
@@ -1960,7 +2029,9 @@ begin
     LabelThemeText.Text := Translate('Dark theme');
     PathThemeIcon.Data.Assign(PathMoonIconTemplate.Data);
   end;
+  PathToolbarThemeIcon.Data.Assign(PathThemeIcon.Data);
   SpeedButtonTheme.Hint := LabelThemeText.Text;
+  SpeedButtonToolbarTheme.Hint := LabelThemeText.Text;
   PaintBoxChart.Repaint;
 end;
 
@@ -2570,6 +2641,184 @@ begin
   PaintBoxChart.Repaint;
 end;
 
+procedure TFormMain.SetPanels(ShowLocations, ShowFolderPanel, ChartOnly: Boolean);
+var
+  Sidebar: Boolean;
+  Order: TArray<TControl>;
+begin
+  FShowLocations := ShowLocations;
+  FShowFolderPanel := ShowFolderPanel;
+  FChartOnly := ChartOnly;
+  Sidebar := FShowLocations and not FChartOnly;
+  LayoutToolbar.BeginUpdate;
+  try
+    // Aligned controls are ordered by position, and a hidden one keeps a stale
+    // position, so set the order before showing any of them.
+    Order := [SpeedButtonSidebar, SpeedButtonLocations, SpeedButtonToolbarTheme, SpeedButtonToolbarSettings,
+      SpeedButtonBack, SpeedButtonUp];
+    for var i := 0 to High(Order) do
+      Order[i].Position.X := i;
+    // Right-aligned controls are placed from the right edge, the one that ends
+    // furthest right first.
+    Order := [SpeedButtonBrowse, SpeedButtonScan, SpeedButtonChartOnly, SpeedButtonFolderPanel];
+    for var i := 0 to High(Order) do
+      Order[i].Position.X := 10000 + 1000 * i;
+    SpeedButtonLocations.Visible := not Sidebar;
+    SpeedButtonToolbarTheme.Visible := not Sidebar;
+    SpeedButtonToolbarSettings.Visible := not Sidebar;
+  finally
+    LayoutToolbar.EndUpdate;
+  end;
+  LayoutDriveSide.Visible := Sidebar;
+  LayoutFolderPanel.Visible := FShowFolderPanel and not FChartOnly;
+  // The header goes back above the scan progress.
+  LayoutHeader.Position.Y := -1;
+  LayoutHeader.Visible := not FChartOnly;
+  SpeedButtonSidebar.IsPressed := LayoutDriveSide.Visible;
+  SpeedButtonFolderPanel.IsPressed := LayoutFolderPanel.Visible;
+  SpeedButtonChartOnly.IsPressed := FChartOnly;
+  MenuItemShowLocations.IsChecked := FShowLocations;
+  MenuItemShowFolderPanel.IsChecked := FShowFolderPanel;
+  MenuItemChartOnly.IsChecked := FChartOnly;
+  UpdateMinimumSize;
+end;
+
+procedure TFormMain.SavePanels;
+begin
+  FIni.WriteBool('Appearance', 'ShowLocationsPanel', FShowLocations);
+  FIni.WriteBool('Appearance', 'ShowFolderPanel', FShowFolderPanel);
+  FIni.UpdateFile;
+end;
+
+// In chart-only mode a panel toggle shows that panel and leaves the mode.
+procedure TFormMain.ToggleLocations;
+begin
+  SetPanels(FChartOnly or not FShowLocations, FShowFolderPanel, False);
+  SavePanels;
+end;
+
+procedure TFormMain.ToggleFolderPanel;
+begin
+  SetPanels(FShowLocations, FChartOnly or not FShowFolderPanel, False);
+  SavePanels;
+end;
+
+procedure TFormMain.UpdateMinimumSize;
+var
+  MinWidth, MinHeight, ToolbarWidth: Single;
+  Area, NewBounds: TRectF;
+  Control: TControl;
+begin
+  MinWidth := LayoutWorkspace.Padding.Left + LayoutWorkspace.Padding.Right + MinChartWidth;
+  if LayoutFolderPanel.Visible then
+    MinWidth := MinWidth + LayoutFolderPanel.Margins.Left + LayoutFolderPanel.Width;
+  ToolbarWidth := LayoutToolbar.Padding.Left + LayoutToolbar.Padding.Right + MinPathWidth;
+  for var i := 0 to LayoutToolbar.ControlsCount - 1 do
+  begin
+    Control := LayoutToolbar.Controls[i];
+    if Control.Visible and (Control.Align in [TAlignLayout.Left, TAlignLayout.Right]) then
+      ToolbarWidth := ToolbarWidth + Control.Margins.Left + Control.Width + Control.Margins.Right;
+  end;
+  MinWidth := Max(MinWidth, ToolbarWidth);
+  if LayoutDriveSide.Visible then
+    MinWidth := MinWidth + LayoutDriveSide.Width;
+  MinHeight := LayoutFooter.Height + Rectangle1.Height + LayoutToolbar.Height + LayoutWorkspace.Padding.Top +
+    PaintBoxChart.Margins.Top + MinChartHeight + LayoutChartViews.Margins.Top + LayoutChartViews.Height +
+    LayoutChartViews.Margins.Bottom;
+  if LayoutHeader.Visible then
+    MinHeight := MinHeight + LayoutHeader.Height;
+  // Constraints are for the whole window, frame included, and never ask for
+  // more than the display has room for.
+  Area := Screen.DisplayFromForm(Self).Workarea;
+  MinWidth := Min(MinWidth + Width - ClientWidth, Area.Width);
+  MinHeight := Min(MinHeight + Height - ClientHeight, Area.Height);
+  Constraints.MinWidth := MinWidth;
+  Constraints.MinHeight := MinHeight;
+  // Windows applies them only to the next resize: grow a window that is now
+  // too small, keeping it on its display.
+  if (WindowState = TWindowState.wsNormal) and ((Width < MinWidth) or (Height < MinHeight)) then
+  begin
+    NewBounds := RectF(Left, Top, Left + Max(Width, Ceil(MinWidth)), Top + Max(Height, Ceil(MinHeight)));
+    NewBounds.Offset(Max(Area.Left - NewBounds.Left, Min(0, Area.Right - NewBounds.Right)),
+      Max(Area.Top - NewBounds.Top, Min(0, Area.Bottom - NewBounds.Bottom)));
+    SetBoundsF(NewBounds);
+  end;
+end;
+
+procedure TFormMain.PopupBelow(Menu: TPopupMenu; Control: TControl);
+begin
+  var P := Control.LocalToScreen(PointF(0, Control.Height));
+  Menu.Popup(P.X, P.Y);
+end;
+
+procedure TFormMain.MenuItemShowLocationsClick(Sender: TObject);
+begin
+  ToggleLocations;
+end;
+
+procedure TFormMain.MenuItemShowFolderPanelClick(Sender: TObject);
+begin
+  ToggleFolderPanel;
+end;
+
+procedure TFormMain.MenuItemChartOnlyClick(Sender: TObject);
+begin
+  SetPanels(FShowLocations, FShowFolderPanel, not FChartOnly);
+end;
+
+procedure TFormMain.SpeedButtonSidebarClick(Sender: TObject);
+begin
+  ToggleLocations;
+end;
+
+procedure TFormMain.SpeedButtonFolderPanelClick(Sender: TObject);
+begin
+  ToggleFolderPanel;
+end;
+
+procedure TFormMain.SpeedButtonChartOnlyClick(Sender: TObject);
+begin
+  SetPanels(FShowLocations, FShowFolderPanel, not FChartOnly);
+end;
+
+procedure TFormMain.SpeedButtonToolbarSettingsClick(Sender: TObject);
+begin
+  PopupBelow(PopupMenuSettings, SpeedButtonToolbarSettings);
+end;
+
+procedure TFormMain.SpeedButtonLocationsClick(Sender: TObject);
+
+  procedure AddItem(const Text, Path: string);
+  var
+    Item: TMenuItem;
+  begin
+    Item := TMenuItem.Create(PopupMenuLocations);
+    PreserveUserText(Item);
+    Item.StyleLookup := 'menuitemstyle';
+    Item.Text := Text;
+    Item.TagString := Path;
+    Item.OnClick := MenuItemLocationClick;
+    PopupMenuLocations.AddObject(Item);
+  end;
+
+begin
+  // The same locations as the hidden panel, built from its current buttons.
+  PopupMenuLocations.Clear;
+  AddItem(LabelSummaryText.Text, '');
+  for var Child in VertScrollBoxDrives.Content.Children do
+    if (Child is TFrameDriveButton) and (TFrameDriveButton(Child).SpeedButtonDrive.TagString <> '') then
+      AddItem(TFrameDriveButton(Child).LabelTitle.Text, TFrameDriveButton(Child).SpeedButtonDrive.TagString);
+  PopupBelow(PopupMenuLocations, SpeedButtonLocations);
+end;
+
+procedure TFormMain.MenuItemLocationClick(Sender: TObject);
+begin
+  if TMenuItem(Sender).TagString = '' then
+    ShowSummary
+  else
+    OpenLocation(TMenuItem(Sender).TagString);
+end;
+
 procedure TFormMain.MenuItemHideClick(Sender: TObject);
 begin
   ExecuteNodeAction(Sender);
@@ -2625,6 +2874,14 @@ begin
   MenuItemFreeSpace.Text := Translate('Don''t draw free space');
   MenuItemLiveScan.Text := Translate('Show results while scanning');
   MenuItemGraphFont.Text := Translate('Select graph font…');
+  MenuItemShowLocations.Text := Translate('Show locations panel');
+  MenuItemShowFolderPanel.Text := Translate('Show folder panel');
+  MenuItemChartOnly.Text := Translate('Chart only');
+  SpeedButtonSidebar.Hint := Translate('Locations panel (Ctrl+B)');
+  SpeedButtonFolderPanel.Hint := Translate('Folder panel (Ctrl+D)');
+  SpeedButtonChartOnly.Hint := Translate('Chart only (F11)');
+  SpeedButtonLocations.Hint := Translate('Locations');
+  SpeedButtonToolbarSettings.Hint := Translate('Settings');
   SpeedButtonUp.Hint := Translate('Parent folder (Alt+Up)');
   SpeedButtonBack.Hint := Translate('Back (Alt+Left)');
   MenuItemInclude.Text := Translate('Include in summary');
